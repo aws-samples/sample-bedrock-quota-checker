@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadBedrockInventory",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:ListFoundationModels",
+        "bedrock:GetFoundationModelAvailability",
+        "bedrock:ListInferenceProfiles",
+        "bedrock:ListProvisionedModelThroughputs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadBedrockQuotas",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:ListServiceQuotas",
+        "servicequotas:ListAWSDefaultServiceQuotas"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadUsageMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:ListMetrics",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentifyAccount",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}

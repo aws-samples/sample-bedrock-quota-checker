@@ -1,93 +1,218 @@
-# bedrock-quota-checker
+# Bedrock Quota Checker
 
+Generate an **English, offline HTML report** of your AWS account's current Amazon Bedrock quotas, model availability, inference profiles, and historical usage. Export the quota inventory as **`quotas.csv`**, with JSON and additional CSV files for further analysis.
 
+Run the Python collector in **AWS CloudShell** or on your **local computer**. No application deployment or AWS infrastructure setup is required.
 
-## Getting started
+The collector uses an explicit allowlist of read-only AWS operations. It does not invoke models, modify resources, enable logging, or request quota increases. It reads service metadata and aggregate metrics, not prompts or model responses. Credentials remain in your environment, and reports are not uploaded automatically.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+**Cost:** running the collector does not generate inference charges. CloudWatch metric retrieval can incur API charges. Start with the Regions you use and the default 14-day window, or use `--skip-usage` for inventory and quotas only.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## What you get
 
-## Add your files
+| Output | What it contains |
+|---|---|
+| **`report.html`** | Offline dashboard with charts, filters, current quotas, reported model availability, and collection quality |
+| **`quotas.csv`** | Current applied quotas and AWS defaults, stored separately, with quota codes, units, scope, and collection timestamps |
+| `report.json` | Complete structured report, including metric series and interpretation limits |
+| ZIP archive | All report files together, ready to download or share |
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+All application-generated interface text, CLI messages, explanations, and documentation are in English. The HTML uses US English number formatting and UTC dates. Names and identifiers returned by AWS are preserved as received.
 
+## Prerequisites
+
+- Git and **Python 3.10 or newer**.
+- AWS credentials for the account you want to inspect.
+- The read permissions in [permissions/collector-read-only.json](permissions/collector-read-only.json).
+- Authorized AWS GitLab access with SSH authentication, plus network access to the Python package index and the AWS APIs for your selected Regions.
+
+The commands below assume a Bash or Zsh terminal. CloudShell provides a browser-based terminal and temporary credentials from your AWS console session. For local execution, use your existing AWS profile or IAM Identity Center session.
+
+This repository is hosted on AWS GitLab. AWS console credentials do not grant access to the repository. External customers need an approved source archive or a repository they can access. If cloning from CloudShell is unavailable, upload the source archive through **Actions → Upload file**, extract it, and run the installation commands from the extracted project directory.
+
+## 1. Open your terminal and clone the repository
+
+**CloudShell:** sign in to the intended AWS account, open [AWS CloudShell](https://console.aws.amazon.com/cloudshell/), and wait for the terminal to start.
+
+**Local computer:** open your terminal.
+
+Run these commands in either environment:
+
+```bash
+git clone git@ssh.gitlab.aws.dev:daniabib/bedrock-quota-checker.git
+cd bedrock-quota-checker
+python3 --version
 ```
-cd existing_repo
-git remote add origin https://gitlab.aws.dev/daniabib/bedrock-quota-checker.git
-git branch -M main
-git push -uf origin main
+
+If `python3` is older than 3.10, use a Python 3.10+ interpreter for all Python commands below. If your CloudShell environment does not provide one, use the local-computer option with a supported Python installation.
+
+## 2. Install the dependencies
+
+Create a virtual environment and install the tested SDK version:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
-## Integrate with your tools
+Check the collector and SDK:
 
-- [ ] [Set up project integrations](https://gitlab.aws.dev/daniabib/bedrock-quota-checker/-/settings/integrations)
+```bash
+python3 bedrock_access_report.py --version
+python3 -c "import boto3; print(boto3.__version__)"
+```
 
-## Collaborate with your team
+The collector does not install or upgrade packages during execution.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## 3. Generate the report
 
-## Test and Deploy
+### AWS CloudShell
 
-Use the built-in continuous integration in GitLab.
+Use the credentials from your console session. List the Regions where your applications send Bedrock requests:
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+```bash
+python3 bedrock_access_report.py \
+  --regions us-east-1 us-west-2 \
+  --days 14 \
+  --output-dir ./reports
+```
 
-***
+You do not need `--profile` in CloudShell. Replace the example Regions with the ones you use. For cross-Region inference, include the **source Region where the application sends the request**.
 
-# Editing this README
+### Local computer with the default AWS profile
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+If your `default` profile is already authenticated:
 
-## Suggestions for a good README
+```bash
+python3 bedrock_access_report.py \
+  --profile default \
+  --regions us-east-1 us-west-2 \
+  --days 14 \
+  --output-dir ./reports
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+For an existing IAM Identity Center profile, refresh the session and use that profile instead:
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+aws sso login --profile customer-readonly
+python3 bedrock_access_report.py \
+  --profile customer-readonly \
+  --regions us-east-1 us-west-2 \
+  --days 14 \
+  --output-dir ./reports
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+If you omit `--regions`, the collector uses the Region configured in your environment or profile. If no Region is configured, it asks you to supply one. If you omit `--profile`, boto3 uses its standard credential chain.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+The collector prints progress and the **absolute paths** of the generated HTML, quota CSV, JSON, and ZIP. Runtime depends on the selected Regions, metric series, and API retries. Isolated collection failures appear in the report instead of silently becoming zero usage.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## 4. Open or download the HTML and quota file
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Each execution creates its own directory and ZIP archive:
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+```text
+reports/
+  bedrock-report_<account-id>_<UTC-timestamp>/
+    report.html
+    quotas.csv
+    report.json
+    models.csv
+    inference_profiles.csv
+    provisioned_throughput.csv
+    usage_summary.csv
+    usage_timeseries.csv
+    collection_issues.csv
+  bedrock-report_<account-id>_<UTC-timestamp>.zip
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Download from CloudShell
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+1. In the terminal output, find the path printed after **`HTML:`**.
+2. Choose **Actions → Download file**, paste that exact path, and download **`report.html`**.
+3. Repeat with the path printed after **`QUOTAS CSV:`** to download **`quotas.csv`**.
+4. Open `report.html` in your browser. Open `quotas.csv` in Excel, another spreadsheet application, or a text editor.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+To download everything at once, use **Actions → Download file** with the **`ZIP:`** path, then extract the archive on your computer. Keeping the files together also preserves the HTML dashboard's links to the CSV and JSON exports.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+### Open files generated on your local computer
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+The files are already on your computer. Open the output directory printed by the collector and double-click **`report.html`**. The dashboard runs offline and requires no AWS credentials or web server. The **`quotas.csv`** file is in the same directory.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Review the files before sharing them: they can contain account IDs, resource identifiers, quotas, and operational usage. Nothing is sent automatically.
 
-## License
-For open source projects, say how it is licensed.
+## Common commands
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+### Inventory and quotas only
+
+Generate HTML, CSV, and JSON without CloudWatch usage queries:
+
+```bash
+python3 bedrock_access_report.py --regions us-east-1 --skip-usage
+```
+
+### Preview the collection plan
+
+Read inventory and metric identities without retrieving usage datapoints:
+
+```bash
+python3 bedrock_access_report.py --regions us-east-1 --days 14 --plan
+```
+
+The plan estimates the initial query workload. Identifiers with observed activity can require additional metric queries during a full run.
+
+### View a 30-day trend
+
+```bash
+python3 bedrock_access_report.py --regions us-east-1 --days 30 --period auto
+```
+
+A 14-day report uses one-minute intervals. A 30-day report uses five-minute intervals; its per-minute rates are averages within those intervals, not reconstructed one-minute peaks. Older data requires coarser resolution.
+
+### Regenerate a saved report without contacting AWS
+
+Replace the example path with a `report.json` file from a previous run:
+
+```bash
+python3 bedrock_access_report.py --render ./reports/YOUR_REPORT_DIRECTORY/report.json
+```
+
+This regenerates HTML, CSV, and ZIP outputs from the saved snapshot. It refreshes application-generated explanations in English while preserving the original collection timestamps and AWS data. It does not refresh quotas or usage from AWS.
+
+### See all options
+
+```bash
+python3 bedrock_access_report.py --help
+```
+
+Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
+
+## How to interpret the results
+
+- **Catalog is not authorization.** Model listings and reported availability do not prove that your application has effective invocation permissions.
+- **Applied quota is not the AWS default.** The report keeps both values. A missing applied value is not replaced with a default or zero.
+- **The denominator is today's quota.** Historical usage is compared with the quota collected now, not necessarily the quota that applied at the time.
+- **Token utilization is an estimate.** Cache accounting, output-token factors, and upfront `max_tokens` reservations affect quota consumption. A low estimate does not rule out throttling.
+- **Missing data is not zero.** Retention, permissions, dimensions, discovery limits, and inactivity can all affect coverage.
+- **Endpoints are separate.** `bedrock-runtime` and `bedrock-mantle` have separate metrics and quota allocations.
+- **Some comparisons show `N/A`.** This version uses compatible Service Quotas usage metadata and two explicit mappings for US Claude Opus 4.7 and Haiku 4.5 profiles. Other unverified relationships remain unmapped. Even a mapped percentage describes the observed series, not guaranteed coverage of all traffic sharing the quota.
+
+See the [customer guide](docs/customer-guide.md) for permission details, metric limitations, and troubleshooting.
+
+## Development and verification
+
+Run the local unit tests without credentials or AWS calls:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+On CloudShell/Linux, verify the script checksum with:
+
+```bash
+sha256sum -c bedrock_access_report.py.sha256
+```
+
+On macOS, use `shasum -a 256 -c bedrock_access_report.py.sha256`.
+
+Generated reports, virtual environments, and local tool caches are excluded from Git. Changes to the collector require updating its SHA-256 file before distribution.

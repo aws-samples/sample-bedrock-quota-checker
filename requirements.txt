@@ -1,0 +1,2 @@
+# Tested SDK version. Requires Python 3.10 or newer.
+boto3==1.43.100

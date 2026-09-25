@@ -1,0 +1,9 @@
+reports/
+bedrock-report_*/
+bedrock-report_*.zip
+.venv/
+__pycache__/
+*.pyc
+.swarm/
+.claude-flow/
+ruvector.db*
