@@ -74,6 +74,30 @@ def serializable(value):
     return value
 
 
+# Display priority for Regions in the report and HTML views. us-east-1 is always
+# first, then the rest of North America, then Europe, then South America, then
+# every other geography. Within each tier Regions are ordered alphabetically.
+NORTH_AMERICA_PREFIXES = ("us-", "ca-", "mx-")
+
+
+def region_sort_key(region):
+    if region == "us-east-1":
+        return (0, region)
+    if region.startswith(NORTH_AMERICA_PREFIXES):
+        return (1, region)
+    if region.startswith("eu-"):
+        return (2, region)
+    if region.startswith("sa-"):
+        return (3, region)
+    return (4, region)
+
+
+def order_regions(regions):
+    """Order Regions by display priority: us-east-1, North America, Europe,
+    South America, then others; alphabetical within each tier."""
+    return sorted(regions, key=region_sort_key)
+
+
 def percentile(values, quantile=0.95):
     if not values:
         return None
@@ -166,14 +190,47 @@ class Collector:
 
     def client(self, service, region):
         key = service, region
-        if key not in self.clients:
-            from botocore.config import Config
-            self.clients[key] = self.session.client(service, region_name=region, config=Config(
-                connect_timeout=10, read_timeout=30,
-                retries={"mode": "standard", "total_max_attempts":4},
-                max_pool_connections=8,
-            ))
-        return self.clients[key]
+        # Regions are collected concurrently; guard the lazy cache so two threads
+        # do not build duplicate clients for the same service/Region pair.
+        with self.lock:
+            if key not in self.clients:
+                from botocore.config import Config
+                self.clients[key] = self.session.client(service, region_name=region, config=Config(
+                    connect_timeout=10, read_timeout=30,
+                    retries={"mode": "standard", "total_max_attempts":4},
+                    max_pool_connections=8,
+                ))
+            return self.clients[key]
+
+    def reserve_metrics(self, candidates):
+        """Atomically claim series against the global --max-metrics budget.
+
+        Truncates `candidates` to the remaining budget, appends the survivors to
+        self.report["metrics"] under the lock, and returns them. Doing the check
+        and the append together prevents concurrent Regions from jointly exceeding
+        the cap.
+        """
+        with self.lock:
+            remaining = max(0, self.args.max_metrics - len(self.report["metrics"]))
+            selected = candidates[:remaining]
+            self.report["metrics"].extend(selected)
+            return selected
+
+    def reserve_metric_request(self):
+        """Atomically claim one GetMetricData call against --max-metric-requests.
+
+        Returns False once the shared budget (across all Regions) is exhausted.
+        """
+        with self.lock:
+            if self.metric_calls >= self.args.max_metric_requests or self.returned_points >= self.args.max_datapoints:
+                return False
+            self.metric_calls += 1
+            return True
+
+    def add_returned_points(self, count):
+        """Add newly returned datapoints to the shared counter under the lock."""
+        with self.lock:
+            self.returned_points += count
 
     def issue(self, region, operation, status, message, resource=""):
         with self.lock:
@@ -314,10 +371,12 @@ class Collector:
             add({"Namespace": "AWS/Bedrock", "MetricName": "Invocations", "Dimensions": [
                 {"Name": "ModelId", "Value": model_id_value},
             ]}, "known_model_id")
-        remaining = max(0, self.args.max_metrics - len(self.report["metrics"]))
-        selected = list(candidates.values())[:remaining]
-        if len(selected) != len(candidates):
-            self.issue(region, "query_plan", "partial", f"Global limit of {self.args.max_metrics} series reached: {len(candidates)-len(selected)} series were not queried.")
+        # Reserve series against the shared --max-metrics budget and append them
+        # atomically, so parallel Regions cannot jointly exceed the global cap.
+        all_candidates = list(candidates.values())
+        selected = self.reserve_metrics(all_candidates)
+        if len(selected) != len(all_candidates):
+            self.issue(region, "query_plan", "partial", f"Global limit of {self.args.max_metrics} series reached: {len(all_candidates)-len(selected)} series were not queried.")
         discovered = sum("ListMetrics" in m["sources"] for m in selected)
         plan = {
             "region": region, "series": len(selected), "discovered_series": discovered,
@@ -326,15 +385,19 @@ class Collector:
             "max_possible_points": len(selected) * int((self.end-self.start).total_seconds()/self.period),
             "initial_get_metric_data_requests": math.ceil(len(selected)/100),
         }
-        self.report["query_plan"].append(plan)
+        with self.lock:
+            self.report["query_plan"].append(plan)
         print(f"[{region}] Plan: {len(selected)} series ({discovered} discovered), {self.period}s periods; limit of {self.args.max_datapoints:,} returned datapoints.", flush=True)
-        self.report["metrics"].extend(selected)
         return selected
 
     def expand_observed(self, region):
-        existing = {m["id"] for m in self.report["metrics"]}
-        additional = []
-        for observed in list(self.report["metrics"]):
+        # Snapshot the shared metric list under the lock; other Regions may be
+        # appending to it concurrently.
+        with self.lock:
+            snapshot = list(self.report["metrics"])
+        existing = {m["id"] for m in snapshot}
+        candidates = []
+        for observed in snapshot:
             if observed["region"] != region or not observed["points"]:
                 continue
             dimensions = observed["metric"]["Dimensions"]
@@ -353,17 +416,16 @@ class Collector:
                 key = metric_id(region, metric)
                 if key in existing:
                     continue
-                if len(self.report["metrics"])+len(additional) >= self.args.max_metrics:
-                    self.issue(region, "expand_observed", "partial", "Series limit reached while expanding identifiers with observed usage.")
-                    self.report["metrics"].extend(additional)
-                    return additional
                 existing.add(key)
-                additional.append({
+                candidates.append({
                     "id": key, "region": region, "metric": metric, "stat": "Sum",
                     "period_seconds": self.period, "sources": ["observed_id_expansion"],
                     "points": [], "status": "not_queried", "messages": [],
                 })
-        self.report["metrics"].extend(additional)
+        # Claim the candidates against the shared budget atomically.
+        additional = self.reserve_metrics(candidates)
+        if len(additional) != len(candidates):
+            self.issue(region, "expand_observed", "partial", "Series limit reached while expanding identifiers with observed usage.")
         if additional:
             print(f"[{region}] Querying {len(additional)} additional series for IDs with observed usage.", flush=True)
         return additional
@@ -384,11 +446,12 @@ class Collector:
             }
             seen_tokens, complete = set(), True
             while True:
-                if self.metric_calls >= self.args.max_metric_requests or self.returned_points >= self.args.max_datapoints:
+                # Atomically claim one request against the shared call/datapoint
+                # budgets so parallel Regions cannot jointly exceed them.
+                if not self.reserve_metric_request():
                     self.issue(region, "get_metric_data", "partial", "Query or datapoint limit reached; results are partial.")
                     complete = False
                     break
-                self.metric_calls += 1
                 response = self.call("cloudwatch", region, "get_metric_data", **query)
                 if response is None:
                     complete = False
@@ -396,6 +459,7 @@ class Collector:
                 for message in response.get("Messages", []):
                     self.issue(region, "get_metric_data", "partial", message.get("Value", message))
                     complete = False
+                new_points = 0
                 for result in response.get("MetricDataResults", []):
                     key = result["Id"]
                     if key not in lookup:
@@ -407,8 +471,12 @@ class Collector:
                         if self.start <= timestamp < self.end and math.isfinite(value):
                             stamp = iso(timestamp)
                             if stamp not in points[key]:
-                                self.returned_points += 1
+                                new_points += 1
                             points[key][stamp] = value
+                # Flush this response's datapoints to the shared counter so the
+                # cross-Region budget check stays accurate.
+                if new_points:
+                    self.add_returned_points(new_points)
                 token = response.get("NextToken")
                 if not token:
                     break
@@ -435,6 +503,20 @@ class Collector:
             if offset % 500 == 0 or offset+100 >= len(metrics):
                 print(f"[{region}] History: {min(offset+100,len(metrics))}/{len(metrics)} series, {self.returned_points:,} datapoints.", flush=True)
 
+    def collect_region(self, region):
+        """Collect everything for a single Region. Safe to run concurrently:
+        shared budgets and counters are guarded by self.lock, and the report
+        lists are only appended to (atomic under the GIL)."""
+        self.inventory(region)
+        self.quotas(region)
+        if not self.args.skip_usage:
+            metrics = self.discover(region)
+            if not self.args.plan:
+                self.fetch_metrics(region, metrics)
+                extra = self.expand_observed(region)
+                if extra:
+                    self.fetch_metrics(region, extra)
+
     def run(self, regions):
         identity = self.call("sts", regions[0], "get_caller_identity")
         if identity is None:
@@ -444,16 +526,25 @@ class Collector:
         self.report["regions"] = regions
         print(f"Account {identity['Account']} | profile {self.args.profile or 'credential-chain'} | {', '.join(regions)}", flush=True)
         print(f"UTC window {iso(self.start)} → {iso(self.end)} | {self.period}s", flush=True)
-        for region in regions:
-            self.inventory(region)
-            self.quotas(region)
-            if not self.args.skip_usage:
-                metrics = self.discover(region)
-                if not self.args.plan:
-                    self.fetch_metrics(region, metrics)
-                    extra = self.expand_observed(region)
-                    if extra:
-                        self.fetch_metrics(region, extra)
+        # Collect Regions concurrently. Global budgets (--max-metrics,
+        # --max-datapoints, --max-metric-requests) remain shared across all
+        # Regions via atomic reservations, so total cost stays capped.
+        workers = max(1, min(self.args.region_workers, len(regions)))
+        if workers == 1 or len(regions) == 1:
+            for region in regions:
+                self.collect_region(region)
+        else:
+            print(f"Collecting {len(regions)} Regions with up to {workers} in parallel.", flush=True)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(self.collect_region, region): region for region in regions}
+                for future in as_completed(futures):
+                    region = futures[future]
+                    # Surface unexpected failures without aborting the other Regions.
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self.issue(region, "collect_region", "error", f"Region collection failed: {exc}")
+                        print(f"[{region}] Collection failed: {exc}", flush=True)
         self.report["completed_at"] = iso(datetime.now(UTC))
         self.report["api_calls"] = dict(self.calls)
         self.report["returned_datapoints"] = self.returned_points
@@ -620,6 +711,7 @@ def parser():
     result.add_argument("--period", default="auto", choices=["auto", "60", "300", "3600"], help="Metric period in seconds; auto respects retention")
     result.add_argument("--model-ids", nargs="+", help="Additional runtime metric IDs to query")
     result.add_argument("--output-dir", default="./reports", help="Parent directory for generated reports (default: ./reports)")
+    result.add_argument("--region-workers", type=int, default=4, help="Regions to collect in parallel; global budgets stay shared (default: 4, use 1 to serialize)")
     result.add_argument("--skip-usage", action="store_true", help="Collect inventory and quotas without CloudWatch metric queries")
     result.add_argument("--plan", action="store_true", help="Read inventory/metric identities without fetching datapoints")
     result.add_argument("--max-metrics", type=int, default=3000, help="Maximum selected series per run (default: 3000)")
@@ -665,9 +757,12 @@ def main():
         if response is None:
             raise RuntimeError("Could not list enabled Regions; use --regions.")
         supported = set(session.get_available_regions("bedrock"))
-        regions = sorted(r["RegionName"] for r in response["Regions"] if r["RegionName"] in supported)
+        regions = [r["RegionName"] for r in response["Regions"] if r["RegionName"] in supported]
         if not regions:
             raise RuntimeError("No enabled Regions match the Bedrock endpoints known to this SDK.")
+    # Order Regions by display priority so the HTML Overview and its Region
+    # selector lead with us-east-1, then North America, Europe, South America.
+    regions = order_regions(regions)
     report = collector.run(regions)
     name = f"bedrock-report_{report['account_id']}_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
     directory = Path(args.output_dir).expanduser().resolve()/name
@@ -754,7 +849,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
  </section>
  <section class="section" id="quotas">
   <div class="panel"><div class="panel-head"><div><h2>Current quotas</h2><p>Applied values and AWS defaults are kept separate.</p></div></div>
-   <div class="filters"><input id="quota-search" placeholder="Search by model, name, or quota code…" aria-label="Search quotas"><select id="quota-kind" aria-label="Quota type"><option value="">All types</option><option value="tokens">Tokens per minute</option><option value="requests">Requests per minute</option><option value="batch">Batch inference</option><option value="provisioned">Provisioned Throughput</option></select><select id="quota-adjustable" aria-label="Adjustable quotas"><option value="">All quotas</option><option value="yes">Adjustable</option><option value="no">Not adjustable</option></select></div>
+   <div class="filters"><input id="quota-search" placeholder="Search by model, name, or quota code…" aria-label="Search quotas"><select id="quota-kind" aria-label="Quota type"><option value="">All types</option><option value="tokens" selected>Tokens per minute</option><option value="requests">Requests per minute</option><option value="batch">Batch inference</option><option value="provisioned">Provisioned Throughput</option></select><select id="quota-adjustable" aria-label="Adjustable quotas"><option value="">All quotas</option><option value="yes">Adjustable</option><option value="no">Not adjustable</option></select></div>
    <div class="note info">A quota defines a limit, not guaranteed available capacity. A percentage appears only when the quota, metric, and units have a confirmed mapping.</div>
    <div class="table-wrap" id="quota-table"></div><div class="pagebar" id="quota-page"></div>
   </div>

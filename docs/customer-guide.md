@@ -1,67 +1,162 @@
-# AWS CloudShell customer guide
+# How to run the Bedrock Quotas & Usage Report
 
-Use the [README walkthrough](../README.md) to perform the complete workflow in **AWS CloudShell**:
+> **Version 0.1.1 — English report and CLI.** Read-only collection has been validated in `us-east-1`. Other accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
 
-1. Sign in to the intended AWS account and open CloudShell.
-2. Confirm the account and role with `aws sts get-caller-identity`.
-3. Run `git clone` in CloudShell and enter the project directory.
-4. Install Python 3.11, create `.venv`, and install `requirements.txt` in CloudShell.
-5. Run the collector in CloudShell to generate the reports.
-6. Download `report.html` and `quotas.csv` using **Actions → Download file**, or download the ZIP containing all outputs.
-7. Open the downloaded files to inspect the results.
+Generate a report of your account's current Amazon Bedrock quotas, reported model availability, inference profiles, and historical usage. Clone the repository, run the collector in your own AWS account, then download **`report.html`** and **`quotas.csv`**.
 
-Every shell command in this guide belongs in CloudShell, in `~/bedrock-quota-checker` with `.venv` activated. The HTML interface, CLI messages, and application-generated explanations are in English.
+Choose either CloudShell or your local terminal below. Both produce the same output formats. The HTML interface, CLI messages, and application-generated explanations are always in English.
 
-**Repository access:** the current AWS GitLab repository requires GitLab permission and a Midway-signed SSH identity usable in the CloudShell session. Console AWS credentials do not grant repository access, and this GitLab instance does not allow Git operations over HTTPS. External customers need an approved repository they can access; use that URL in the README's clone command. See the [GitLab access documentation](https://docs.hub.amazon.dev/docs/gitlab/index.html).
+The collector uses read-only AWS API operations. It does not invoke models, subscribe to models, request quota increases, enable logging, or change resources. It collects service metadata and aggregate metrics, not prompts or model responses.
 
-**Read-only collection:** the collector does not invoke models, subscribe to models, request quota increases, enable logging, or change AWS resources. It reads service metadata and aggregate metrics, not prompts or model responses. It generates no inference charges, but CloudWatch metric retrieval can incur API charges.
+**Cost:** the collector does not generate inference charges. CloudWatch metric retrieval, including `GetMetricData`, can incur API charges. Start with the Regions you use and a 14-day window. Use `--skip-usage` if you only need inventory and quotas.
 
-**Data handling:** credentials stay in the CloudShell environment. Reports remain there until you download them. No report is uploaded or emailed automatically. Review the contents before sharing them through your organization's approved channel.
+**Data handling:** credentials stay in your AWS environment. The report remains in CloudShell until you download it. No report is uploaded or emailed automatically.
 
-## Files generated in CloudShell
+## Option A — AWS CloudShell
 
-Each execution creates a separate directory and ZIP under the selected output directory:
+### 1. Sign in to the account you want to inspect
+
+Open the [AWS Console](https://console.aws.amazon.com/) and select the appropriate account and role. The role needs permission to open CloudShell and to perform the read operations listed below.
+
+### 2. Open CloudShell
+
+Choose the terminal icon in the console navigation bar, or search for **CloudShell**. Wait for the terminal to become available.
+
+The collector can query multiple Regions from one CloudShell session, subject to your account permissions, Region availability, and network connectivity.
+
+### 3. Clone the repository and install dependencies
+
+Run:
+
+```bash
+git clone https://github.com/dcabib/bedrock-quota-checker.git
+cd bedrock-quota-checker
+python3 --version
+```
+
+The tested dependencies require **Python 3.10 or newer**. If `python3` is older, use a supported Python interpreter for the commands below or follow the local-terminal option.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+sha256sum -c bedrock_access_report.py.sha256
+python3 bedrock_access_report.py --version
+python3 -c "import boto3; print(boto3.__version__)"
+```
+
+CloudShell provides temporary AWS credentials from your console session. The collector uses those credentials without a `--profile` argument.
+
+### 4. Run the report
+
+List the Regions where your applications send Bedrock requests:
+
+```bash
+python3 bedrock_access_report.py \
+  --regions us-east-1 us-west-2 sa-east-1 \
+  --days 14 \
+  --output-dir ./reports
+```
+
+Replace the example Regions with your own. For cross-Region inference, include the **source Region where the application sends its request**.
+
+Other commands:
+
+```bash
+# Use the Region configured in your environment.
+python3 bedrock_access_report.py
+
+# Inspect the collection plan before retrieving metric datapoints.
+python3 bedrock_access_report.py \
+  --regions us-east-1 us-west-2 --days 14 --plan
+
+# Collect a 30-day trend using an appropriate metric resolution.
+python3 bedrock_access_report.py \
+  --regions us-east-1 us-west-2 --days 30 --period auto
+
+# Collect inventory and quotas without CloudWatch usage queries.
+python3 bedrock_access_report.py \
+  --regions us-east-1 us-west-2 --skip-usage
+```
+
+Runtime depends on the number of Regions, models, metric series, and API retries. The collector prints progress and the absolute output paths. An isolated permission error produces a partial report with an explanation.
+
+### 5. Download and view the results
+
+Each execution creates a new directory and a ZIP under the selected output directory:
 
 ```text
 reports/bedrock-report_<account-id>_<UTC-timestamp>/
 reports/bedrock-report_<account-id>_<UTC-timestamp>.zip
 ```
 
-Use the actual absolute paths printed after `HTML:`, `QUOTAS CSV:`, and `ZIP:` with **Actions → Download file**. The default output location is relative to the project directory where the command runs.
+To download the two primary files:
+
+1. Find the absolute path printed after **`HTML:`**.
+2. In CloudShell, choose **Actions → Download file**, paste that path, and download `report.html`.
+3. Repeat with the path after **`QUOTAS CSV:`** to download `quotas.csv`.
+4. Open the HTML in your browser and the CSV in your preferred spreadsheet application.
+
+Alternatively, use **Actions → Download file** with the exact **`ZIP:`** path. Extract the archive on your computer and open `report.html`. Keeping the files together preserves the dashboard's links to the CSV and JSON exports.
+
+The HTML report works offline, without credentials, external chart libraries, or an additional installation.
 
 | File | Purpose |
 |---|---|
-| `report.html` | Offline dashboard with inventory, quotas, usage charts, and collection issues |
-| `quotas.csv` | Applied quotas and AWS defaults, kept separate |
+| `report.html` | Interactive report with inventory, quotas, usage charts, and collection issues |
 | `report.json` | Complete structured report, including sources, timestamps, and limitations |
 | `models.csv` | Catalog and reported model availability |
 | `inference_profiles.csv` | System-defined and application inference profiles |
 | `provisioned_throughput.csv` | Existing provisioned resources and allocated/desired model units |
+| `quotas.csv` | Applied quotas and AWS defaults, kept separate |
 | `usage_summary.csv` | Usage totals, interval statistics, and supported quota comparisons |
 | `usage_timeseries.csv` | Timestamped metric data with dimensions and resolution |
 | `collection_issues.csv` | Missing permissions, unavailable data, and other collection problems |
 
-The HTML works offline without credentials or external chart libraries. Extract the ZIP and keep the files together to preserve the dashboard's CSV and JSON download links.
+The default output location is relative to the folder where you run the command; it is not necessarily your CloudShell home directory.
 
-## Additional commands in CloudShell
+### 6. Share only if needed
 
-Read the inventory and metric identities before retrieving usage datapoints:
+Review the report before sharing it. Files can contain your account ID, resource identifiers, quotas, and operational usage.
 
-```bash
-python bedrock_access_report.py --regions us-east-1 us-west-2 --days 14 --plan
-```
+If your AWS contact needs to review the findings, send the files you choose through your organization's approved channel. Credentials, prompts, and model responses are not needed.
 
-This is a read-only discovery run. It estimates the initial metric query workload; identifiers with observed activity can require additional queries during a full run.
+## Option B — Your own terminal
 
-Regenerate files from a saved JSON report without contacting AWS. Replace the example directory below with the directory from a previous run:
+Use Git, Python 3.10+, and your existing AWS credentials. Clone the repository and install its dependencies in a virtual environment:
 
 ```bash
-python bedrock_access_report.py --render ./reports/YOUR_REPORT_DIRECTORY/report.json
+git clone https://github.com/dcabib/bedrock-quota-checker.git
+cd bedrock-quota-checker
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
-This refreshes application-generated explanations in English while preserving the original collection timestamps and AWS data. Download the regenerated files using the paths printed by this command. It does not retrieve fresh quotas or usage.
+If your `default` profile is already authenticated:
 
-Use `python bedrock_access_report.py --help` for all options, including explicit timestamps, known model identifiers, and collection limits.
+```bash
+python3 bedrock_access_report.py \
+  --profile default \
+  --regions us-east-1 us-west-2 \
+  --days 14 \
+  --output-dir ./reports
+```
+
+Use your organization's existing temporary-credential or IAM Identity Center flow. For an already configured AWS CLI SSO profile:
+
+```bash
+aws sso login --profile customer-readonly
+python3 bedrock_access_report.py \
+  --profile customer-readonly \
+  --regions us-east-1 us-west-2 \
+  --days 14 \
+  --output-dir ./reports
+```
+
+If the profile is not configured yet, follow your organization's AWS CLI setup instructions. The collector also supports the standard boto3 credential chain when you omit `--profile`.
+
+Open `report.html` directly from the generated folder. The `quotas.csv` file is in the same folder. No CloudShell download is needed for a local run.
 
 ## Permissions
 
@@ -109,9 +204,9 @@ The collector does not attach or modify IAM policies.
 
 | Symptom | What to check |
 |---|---|
-| Python cannot import boto3 | Repeat README Step 4 in CloudShell and activate `.venv` before running the collector. |
-| The SDK does not recognize an operation | Activate `.venv` and run `python -m pip install -r requirements.txt` from the CloudShell project directory. |
-| Credentials missing or expired | Reopen CloudShell from the intended AWS console account and role, then run `aws sts get-caller-identity`. |
+| Python cannot import boto3 | Check the environment and follow the release's dependency instructions. |
+| The SDK does not recognize an operation | Update to a release-compatible boto3 version; the collector should identify the unsupported operation. |
+| Credentials missing or expired | Refresh your SSO session or reopen CloudShell with the intended role. |
 | Region not configured | Supply explicit `--regions` values. |
 | `AccessDenied` | Review the exact failed action and Region in `collection_issues.csv` with your administrator. A failed read is not proof that the model itself is inaccessible. |
 | Endpoint or connection error | Check Region support, SDK version, account Region status, and network access. The error alone does not establish which is responsible. |
