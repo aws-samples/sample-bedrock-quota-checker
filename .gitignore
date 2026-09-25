@@ -11,3 +11,6 @@ reports/
 
 # OS metadata
 .DS_Store
+
+# Local vector database
+ruvector.db
