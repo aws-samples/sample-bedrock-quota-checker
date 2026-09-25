@@ -2,6 +2,7 @@
 """Read-only Bedrock inventory, quotas and CloudWatch history. No inference calls."""
 
 import argparse
+import base64
 import csv
 import hashlib
 import io
@@ -9,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 from collections import Counter
@@ -16,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import zipfile
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 UTC = timezone.utc
 # Narrow mappings verified against quota definitions and system profile model IDs.
 # Names are guards against changed quota semantics, not fuzzy matching rules.
@@ -260,7 +262,7 @@ class Collector:
             self.issue(region, operation, status, f"{code}: {error.get('Message', str(exc))}", kwargs.get("modelId", ""))
             return None
 
-    def listing(self, service, region, operation, key, token_key="nextToken", **kwargs):
+    def listing(self, service, region, operation, key, token_key="nextToken", **kwargs):  # nosec B107 - Pagination field name, not a credential.
         rows, visited, status = [], set(), "ok"
         for _ in range(1000):
             response = self.call(service, region, operation, **kwargs)
@@ -695,7 +697,24 @@ def export(report, directory, collect_only=False):
 def render(report, path):
     # Escaping '<' prevents data from closing the inert JSON script element.
     data = json.dumps(report, ensure_ascii=False, separators=(",", ":"), allow_nan=False).replace("<", "\\u003c")
-    atomic_text(path, HTML.replace("__REPORT_JSON__", data))
+    document = HTML.replace("__REPORT_JSON__", data, 1)
+
+    def block_hashes(tag):
+        # Hash the exact emitted content, including whitespace and report data.
+        blocks = re.findall(rf"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>", document, re.DOTALL)
+        return " ".join(
+            "'sha256-" + base64.b64encode(hashlib.sha256(block.encode("utf-8")).digest()).decode("ascii") + "'"
+            for block in blocks
+        )
+
+    policy = (
+        "default-src 'none'; "
+        f"script-src {block_hashes('script')}; script-src-attr 'none'; "
+        f"style-src {block_hashes('style')}; style-src-attr 'none'; "
+        "img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    )
+    # Replace only the meta placeholder; a data value may contain the same text.
+    atomic_text(path, document.replace("__REPORT_CSP__", policy, 1))
 
 
 def parser():
@@ -780,7 +799,7 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="__REPORT_CSP__">
 <title>Bedrock · Quotas & usage</title>
 <style>
 :root{--ink:#132a32;--muted:#607780;--teal:#007e80;--border:#dde7e8;--paper:#f4f7f7;--orange:#c06a18;--blue:#597bea}
@@ -795,6 +814,8 @@ nav button:hover{background:#203e47}nav button.active{background:#24515a;color:#
 main{margin-left:228px;padding:26px 40px 60px;max-width:1800px}.topline{display:flex;justify-content:space-between;gap:16px;align-items:center;border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:26px}
 .eyebrow{text-transform:uppercase;letter-spacing:1.8px;font-size:10px;font-weight:750;color:var(--muted)}.tag{display:inline-flex;align-items:center;gap:7px;border:1px solid #c9e5dc;background:#edf9f4;color:#207051;border-radius:20px;padding:5px 11px;font-size:11px;font-weight:650}.tag:before{content:"";width:6px;height:6px;background:#36a780;border-radius:100%}
 .downloads{display:flex;gap:10px;flex-wrap:wrap}.downloads a{display:inline-block;text-decoration:none;background:#fff;border:1px solid var(--border);border-radius:7px;padding:8px 13px;font-size:12px;font-weight:650}
+.text-xs{font-size:11px}.text-sm{font-size:12px}
+.dot[data-color="#007e80"]{background:#007e80}.dot[data-color="#597bea"]{background:#597bea}.dot[data-color="#c98536"]{background:#c98536}
 h1{font-size:32px;line-height:1.2;letter-spacing:-1.1px;margin:9px 0 10px}h2{font-size:18px;letter-spacing:-.35px;margin:0 0 5px}h3{font-size:14px;margin:0 0 10px}p{margin:0 0 12px}.muted{color:var(--muted)}.lead{font-size:14px;color:var(--muted);max-width:900px}
 .scope{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:23px 0}.scope label{color:var(--muted);font-size:12px}.scope select{min-width:145px}
 select,input{border:1px solid #ccdadd;background:#fff;border-radius:7px;padding:9px 12px;color:var(--ink);min-width:0}input{width:300px}.pill{background:#e9eff1;border-radius:6px;font-size:12px;padding:7px 10px;color:#46646e}
@@ -837,15 +858,15 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
   <div id="run-notice"></div>
   <div class="panel">
    <div class="panel-head"><div><h2>Usage over time</h2><p>One identifier at a time, preserving the original metric dimensions.</p></div><select id="resource" class="resource-select" aria-label="Model or profile to display"></select></div>
-   <div class="panel-head"><div class="tabs" id="chart-tabs"><button data-mode="tokens" class="active">Tokens</button><button data-mode="requests">Requests</button><button data-mode="throttles">Throttles</button></div><span class="muted" id="chart-unit" style="font-size:11px"></span></div>
+   <div class="panel-head"><div class="tabs" id="chart-tabs"><button data-mode="tokens" class="active">Tokens</button><button data-mode="requests">Requests</button><button data-mode="throttles">Throttles</button></div><span class="muted text-xs" id="chart-unit"></span></div>
    <div class="chart"><canvas id="chart" role="img" aria-label="Observed usage during the reporting period"></canvas><div class="tooltip" id="tooltip" hidden></div></div>
    <div class="legend" id="legend"></div>
-   <p class="muted" id="chart-method" style="font-size:11px"></p>
+   <p class="muted text-xs" id="chart-method"></p>
    <div class="mini-grid" id="resource-stats"></div>
    <div id="capacity-comparison"></div>
   </div>
   <div class="note">Historical usage is compared with today's quotas. Token estimates do not reproduce the <code>max_tokens</code> reservations used for capacity control. A low estimate does not rule out throttling.</div>
-  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic.</p></div><a href="usage_summary.csv" download style="font-size:12px">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><div class="pagebar" id="usage-page"></div></div>
+  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic.</p></div><a href="usage_summary.csv" download class="text-sm">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><div class="pagebar" id="usage-page"></div></div>
  </section>
  <section class="section" id="quotas">
   <div class="panel"><div class="panel-head"><div><h2>Current quotas</h2><p>Applied values and AWS defaults are kept separate.</p></div></div>
@@ -862,12 +883,12 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
  </section>
  <section class="section" id="profiles">
   <div class="panel"><div class="panel-head"><div><h2>Inference profiles</h2><p>Source Region, type, and reported destinations. Profiles do not represent independent quotas.</p></div><input id="profile-search" placeholder="Search profiles…" aria-label="Search profiles"></div><div class="table-wrap" id="profile-table"></div><div class="pagebar" id="profile-page"></div></div>
-  <div class="panel"><h2>Provisioned Throughput</h2><p class="muted" style="font-size:12px">Existing resources and allocated units, separate from allocation quotas.</p><div class="table-wrap" id="provisioned-table"></div></div>
+  <div class="panel"><h2>Provisioned Throughput</h2><p class="muted text-sm">Existing resources and allocated units, separate from allocation quotas.</p><div class="table-wrap" id="provisioned-table"></div></div>
  </section>
  <section class="section" id="quality">
   <div class="panel"><h2>Collection coverage</h2><div id="quality-summary"></div><div class="table-wrap" id="quality-table"></div><div class="pagebar" id="quality-page"></div></div>
   <div class="panel"><h2>Interpretation limits</h2><ul class="quality-list" id="limitations"></ul></div>
-  <div class="panel"><h2>Operations performed</h2><p class="muted" style="font-size:12px">Logical collector calls; internal SDK retries may generate additional requests.</p><div class="table-wrap" id="calls-table"></div></div>
+  <div class="panel"><h2>Operations performed</h2><p class="muted text-sm">Logical collector calls; internal SDK retries may generate additional requests.</p><div class="table-wrap" id="calls-table"></div></div>
  </section>
  <div class="footer" id="footer"></div>
 </main>
@@ -938,7 +959,7 @@ function renderChart(){
  ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Successful requests","#007e80"]]:[["InvocationThrottles","Throttles","#c98536"]];
  const series=definitions.map(([name,label,color])=>({name,label,color,metric:sumMetric(g,name)})).filter(s=>s.metric?.points.length);
  $("chart-unit").textContent=state.mode==="tokens"?"tokens / min":state.mode==="requests"?"requests / min":"throttles / min";
- $("legend").innerHTML=definitions.map(([name,label,color])=>`<span><i class="dot" style="background:${color}"></i>${h(label)}${!sumMetric(g,name)?.points.length?" · no data":""}</span>`).join("");
+ $("legend").innerHTML=definitions.map(([name,label,color])=>`<span><i class="dot" data-color="${h(color)}"></i>${h(label)}${!sumMetric(g,name)?.points.length?" · no data":""}</span>`).join("");
  const inv=total(g,mantle?"Inferences":"Invocations"),input=total(g,mantle?"TotalInputTokens":"InputTokenCount"),output=total(g,mantle?"TotalOutputTokens":"OutputTokenCount");
  const stats=[[mantle?"Completed inferences":"Successful requests",inv,"Total of returned datapoints"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Metric not published in this namespace":"Includes the effects of client retries"]];
  $("resource-stats").innerHTML=stats.map(([label,value,sub])=>`<div><label>${h(label)}</label><strong>${fmt(value)}</strong><small>${h(sub)}</small></div>`).join("");
@@ -991,7 +1012,7 @@ function renderProfiles(){
 }
 function renderQuality(){
  const metrics=scoped(D.metrics),counts={};for(const m of metrics)counts[m.status]=(counts[m.status]||0)+1;
- $("quality-summary").innerHTML=`<div class="cards">${[["With data",counts.ok||0],["No datapoints",counts.no_data||0],["Partial / error",(counts.partial||0)+(counts.error||0)],["Not queried",counts.not_queried||0]].map(([label,value])=>`<div class="card"><label>${h(label)}</label><strong>${fmt(value)}</strong></div>`).join("")}</div><p class="muted" style="font-size:12px">${fmt(metrics.reduce((n,m)=>n+m.points.length,0))} datapoints returned in this Region. “No datapoints” does not mean zero usage.</p>`;
+ $("quality-summary").innerHTML=`<div class="cards">${[["With data",counts.ok||0],["No datapoints",counts.no_data||0],["Partial / error",(counts.partial||0)+(counts.error||0)],["Not queried",counts.not_queried||0]].map(([label,value])=>`<div class="card"><label>${h(label)}</label><strong>${fmt(value)}</strong></div>`).join("")}</div><p class="muted text-sm">${fmt(metrics.reduce((n,m)=>n+m.points.length,0))} datapoints returned in this Region. “No datapoints” does not mean zero usage.</p>`;
  const rows=scoped(D.collection_issues);
  pagination("quality",rows,items=>table(["Operation","Status","Resource / detail"],items.map(i=>`<tr><td><code>${h(i.operation)}</code></td><td>${badge(i.status,"warn")}</td><td>${h(i.message)}<small>${h(i.resource)}</small></td></tr>`)),"quality-table","quality-page",15);
  $("limitations").innerHTML=D.limitations.map(x=>`<li>${h(x)}</li>`).join("");

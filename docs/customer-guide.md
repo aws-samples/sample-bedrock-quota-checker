@@ -1,6 +1,6 @@
 # How to run the Bedrock Quotas & Usage Report
 
-> **Version 0.1.1 — English report and CLI.** Read-only collection has been validated in `us-east-1`. Other accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
+> **Version 0.1.2 — English report and CLI.** Read-only collection has been validated in `us-east-1`. Other accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
 
 Generate a report of your account's current Amazon Bedrock quotas, reported model availability, inference profiles, and historical usage. Clone the repository, run the collector in your own AWS account, then download **`report.html`** and **`quotas.csv`**.
 
@@ -194,7 +194,7 @@ The collector does not attach or modify IAM policies.
 
 **Endpoints have separate quotas and metrics.** `bedrock-runtime` and `bedrock-mantle` are shown separately. Mantle input/output token quotas are separate from runtime quotas. Missing or unverified quota-to-metric relationships appear as `N/A`.
 
-**Quota correlations are deliberately limited in v0.1.1.** The collector uses compatible Service Quotas usage metadata and two explicit mappings for the US Claude Opus 4.7 and Haiku 4.5 profiles. Percentages describe the observed series, not guaranteed coverage of all traffic sharing a quota.
+**Quota correlations are deliberately limited in this release.** The collector uses compatible Service Quotas usage metadata and two explicit mappings for the US Claude Opus 4.7 and Haiku 4.5 profiles. Percentages describe the observed series, not guaranteed coverage of all traffic sharing a quota.
 
 **No data is not zero usage.** Missing datapoints can reflect inactivity, unavailable metrics, retention, permissions, discovery limits, or a different Region/dimension. The report preserves those limitations.
 

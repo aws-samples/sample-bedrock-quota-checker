@@ -248,6 +248,8 @@ See the [customer guide](docs/customer-guide.md) for permission details, metric 
 
 ## Development and verification
 
+The report uses per-file SHA-256 hashes to authorize its embedded scripts and stylesheet. See [security finding remediation](docs/security-findings.md) for the CSP design, the pagination-field B107 annotation, and verification details.
+
 Run the local unit tests without credentials or AWS calls:
 
 ```bash
