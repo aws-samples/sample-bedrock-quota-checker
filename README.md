@@ -248,7 +248,7 @@ See the [customer guide](docs/customer-guide.md) for permission details, metric 
 
 ## Development and verification
 
-The report uses per-file SHA-256 hashes to authorize its embedded scripts and stylesheet. See [security finding remediation](docs/security-findings.md) for the CSP design, the pagination-field B107 annotation, and verification details.
+See [security finding remediation](docs/security-findings.md) for the CSP design, the pagination-field B107 annotation, and verification details.
 
 Run the local unit tests without credentials or AWS calls:
 
@@ -256,12 +256,4 @@ Run the local unit tests without credentials or AWS calls:
 python3 -m unittest discover -s tests -v
 ```
 
-On CloudShell/Linux, verify the script checksum with:
-
-```bash
-sha256sum -c bedrock_access_report.py.sha256
-```
-
-On macOS, use `shasum -a 256 -c bedrock_access_report.py.sha256`.
-
-Generated reports, virtual environments, and local tool caches are excluded from Git. Changes to the collector require updating its SHA-256 file before distribution.
+Generated reports, virtual environments, and local tool caches are excluded from Git.

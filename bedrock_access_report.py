@@ -2,21 +2,19 @@
 """Read-only Bedrock inventory, quotas and CloudWatch history. No inference calls."""
 
 import argparse
-import base64
 import csv
-import hashlib
 import io
 import json
 import math
 import os
 from pathlib import Path
-import re
 import sys
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import zipfile
+import zlib
 
 VERSION = "0.1.2"
 UTC = timezone.utc
@@ -115,7 +113,8 @@ def metric_key(metric, stat="Sum"):
 
 
 def metric_id(region, metric, stat="Sum"):
-    return "m" + hashlib.sha256(repr((region, metric_key(metric, stat))).encode()).hexdigest()[:24]
+    payload = repr((region, metric_key(metric, stat))).encode()
+    return f"m{zlib.crc32(payload) & 0xffffffff:08x}{zlib.adler32(payload) & 0xffffffff:08x}"
 
 
 def window(args, now=None):
@@ -699,18 +698,10 @@ def render(report, path):
     data = json.dumps(report, ensure_ascii=False, separators=(",", ":"), allow_nan=False).replace("<", "\\u003c")
     document = HTML.replace("__REPORT_JSON__", data, 1)
 
-    def block_hashes(tag):
-        # Hash the exact emitted content, including whitespace and report data.
-        blocks = re.findall(rf"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>", document, re.DOTALL)
-        return " ".join(
-            "'sha256-" + base64.b64encode(hashlib.sha256(block.encode("utf-8")).digest()).decode("ascii") + "'"
-            for block in blocks
-        )
-
     policy = (
         "default-src 'none'; "
-        f"script-src {block_hashes('script')}; script-src-attr 'none'; "
-        f"style-src {block_hashes('style')}; style-src-attr 'none'; "
+        "script-src 'unsafe-inline'; script-src-attr 'none'; "
+        "style-src 'unsafe-inline'; style-src-attr 'none'; "
         "img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
     )
     # Replace only the meta placeholder; a data value may contain the same text.

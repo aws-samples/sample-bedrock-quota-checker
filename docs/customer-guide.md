@@ -40,7 +40,6 @@ The tested dependencies require **Python 3.10 or newer**. If `python3` is older,
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
-sha256sum -c bedrock_access_report.py.sha256
 python3 bedrock_access_report.py --version
 python3 -c "import boto3; print(boto3.__version__)"
 ```

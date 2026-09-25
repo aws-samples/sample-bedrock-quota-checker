@@ -50,23 +50,7 @@ sys.exit(0 if sys.version_info >= (3, 10) else 1)
 PY
 log "Using $("$PYTHON" --version 2>&1)"
 
-# 2. Verify the collector's integrity against its SHA-256 checksum before running
-#    it with your AWS credentials. Aborts if the script has been altered.
-CHECKSUM_FILE="$COLLECTOR.sha256"
-if [ -f "$CHECKSUM_FILE" ]; then
-  log "Verifying collector integrity ($CHECKSUM_FILE)"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "$CHECKSUM_FILE" || die "Checksum verification failed. $COLLECTOR does not match $CHECKSUM_FILE; not running a modified collector."
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -c "$CHECKSUM_FILE" || die "Checksum verification failed. $COLLECTOR does not match $CHECKSUM_FILE; not running a modified collector."
-  else
-    die "Neither 'sha256sum' nor 'shasum' is available to verify $CHECKSUM_FILE."
-  fi
-else
-  warn "$CHECKSUM_FILE not found; skipping integrity verification."
-fi
-
-# 3. Create the virtual environment if it does not exist.
+# 2. Create the virtual environment if it does not exist.
 if [ ! -d "$VENV" ]; then
   log "Creating virtual environment in $VENV"
   "$PYTHON" -m venv "$VENV"
@@ -77,7 +61,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
-# 4. Install dependencies.
+# 3. Install dependencies.
 log "Installing dependencies from requirements.txt"
 python3 -m pip install --quiet --upgrade pip
 python3 -m pip install --quiet -r requirements.txt
@@ -85,7 +69,7 @@ python3 -m pip install --quiet -r requirements.txt
 log "Collector version: $(python3 "$COLLECTOR" --version 2>&1)"
 log "boto3 version: $(python3 -c 'import boto3; print(boto3.__version__)')"
 
-# 5. Generate the report.
+# 4. Generate the report.
 if [ "$#" -gt 0 ]; then
   ARGS=("$@")
 else

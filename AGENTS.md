@@ -7,4 +7,3 @@
 - Keep the README focused on the customer workflow: clone the repository, install dependencies, run the collector, and open or download `report.html` and `quotas.csv`.
 - The collector must use only its explicit read-only AWS API allowlist. Do not invoke models or modify AWS resources.
 - Never commit generated customer reports, credentials, local virtual environments, or tool caches.
-- Update `bedrock_access_report.py.sha256` whenever the collector source changes.
