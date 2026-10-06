@@ -1,6 +1,6 @@
 # How to run the Bedrock Quotas & Usage Report
 
-> **Version 0.1.2 — English report and CLI.** Read-only collection has been validated in `us-east-1`. Other accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
+> **Version 0.2.0 — English report and CLI.** Diagnostic queries run first, newest windows first, and incomplete reports can be resumed. Accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
 
 Generate a report of your account's current Amazon Bedrock quotas, reported model availability, inference profiles, and historical usage. Clone the repository, run the collector in your own AWS account, then download **`report.html`** and **`quotas.csv`**.
 
@@ -29,8 +29,8 @@ The collector can query multiple Regions from one CloudShell session, subject to
 Run:
 
 ```bash
-git clone https://github.com/dcabib/bedrock-quota-checker.git
-cd bedrock-quota-checker
+git clone https://github.com/aws-samples/sample-bedrock-quota-checker.git
+cd sample-bedrock-quota-checker
 python3 --version
 ```
 
@@ -125,8 +125,8 @@ If your AWS contact needs to review the findings, send the files you choose thro
 Use Git, Python 3.10+, and your existing AWS credentials. Clone the repository and install its dependencies in a virtual environment:
 
 ```bash
-git clone https://github.com/dcabib/bedrock-quota-checker.git
-cd bedrock-quota-checker
+git clone https://github.com/aws-samples/sample-bedrock-quota-checker.git
+cd sample-bedrock-quota-checker
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
@@ -193,11 +193,31 @@ The collector does not attach or modify IAM policies.
 
 **Endpoints have separate quotas and metrics.** `bedrock-runtime` and `bedrock-mantle` are shown separately. Mantle input/output token quotas are separate from runtime quotas. Missing or unverified quota-to-metric relationships appear as `N/A`.
 
-**Quota correlations are deliberately limited in this release.** The collector uses compatible Service Quotas usage metadata and two explicit mappings for the US Claude Opus 4.7 and Haiku 4.5 profiles. Percentages describe the observed series, not guaranteed coverage of all traffic sharing a quota.
+**Quota correlations require validated mappings.** The collector uses compatible Service Quotas usage metadata and explicit Runtime/Mantle mappings listed in the [README](../README.md#how-to-interpret-the-results). Exact quota codes, names, scope and metric identities must agree. Runtime profile destinations are checked. Percentages are withheld for incomplete queries and do not guarantee coverage of all traffic sharing a quota.
+
+**Daily quotas are a separate diagnostic.** `Cross-Model Max Tokens Per Day` is shown prominently, but its pricing-based accounting cannot be reconstructed by summing raw token counts. Obtain quota-specific evidence and the application's exact errors.
+
+**Mantle client errors exclude early HTTP 429 responses.** Collect HTTP status, error code, timestamp, model, source Region, endpoint and request ID from the application. A zero `InferenceClientErrors` counter cannot rule out throttling.
 
 **No data is not zero usage.** Missing datapoints can reflect inactivity, unavailable metrics, retention, permissions, discovery limits, or a different Region/dimension. The report preserves those limitations.
 
 **Provisioned capacity is separate.** Existing Model Units describe allocated resources. A quota on Model Units describes an allocation limit. Neither is automatically converted into on-demand RPM or TPM.
+
+## Complete an interrupted collection
+
+Local budget exhaustion is recorded separately from an AWS API failure. The saved report includes the attempt's limits, completed time windows and deferred metric identities.
+
+```bash
+python3 bedrock_access_report.py \
+  --resume ./reports/YOUR_REPORT_DIRECTORY/report.json \
+  --max-metric-requests 200 --output-dir ./reports
+```
+
+Use credentials for the original account. Resume preserves the original scope, resolution and quota snapshot and writes a new directory. Each attempt gets a fresh budget; it can incur CloudWatch retrieval charges. Completed windows are skipped. Interrupted windows are queried again and points deduplicated. Older v0.1.2 reports require requerying the full window for incomplete series. If that resolution has expired from CloudWatch retention, create a new report at a supported resolution.
+
+Resume does not refresh inventory/quotas or guarantee recovery after a killed process. Use a new collection to discover new resources or obtain current quotas.
+
+History defaults to discovered metric identities plus explicit `--model-ids`. Add `--include-inactive-models` for full catalog activity probes or `--include-api-usage` for administrative `AWS/Usage` metrics. `--model-ids` is additive, not an exclusive filter.
 
 ## Troubleshooting
 
@@ -210,6 +230,8 @@ The collector does not attach or modify IAM policies.
 | `AccessDenied` | Review the exact failed action and Region in `collection_issues.csv` with your administrator. A failed read is not proof that the model itself is inaccessible. |
 | Endpoint or connection error | Check Region support, SDK version, account Region status, and network access. The error alone does not establish which is responsible. |
 | No metrics returned | Check the source Region, endpoint, model/profile identifier, time range, permissions, and available dimensions. |
+| Local budget exhausted | Resume the saved JSON, restrict the scope of a new collection, or explicitly raise the relevant budget. A local limit does not indicate an inference quota error. |
+| `MissingResult` in a v0.1.2 report | The old collector could use this status when its request budget ended before an API call. Resume with v0.2.0 to retry incomplete series. |
 | Old model missing from discovery | CloudWatch `ListMetrics` omits metrics inactive for two weeks. Known identifiers may still permit direct history queries within retention. |
 | Default quota shown without applied quota | The API may not expose an applied value for that quota. The report should preserve this distinction. |
 | Throttles with apparently low utilization | Review estimation limits, reservations, bursts, inference mode, and other service constraints before attributing the cause. |

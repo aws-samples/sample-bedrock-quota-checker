@@ -46,7 +46,7 @@ chmod ugo+x run.sh
 ./run.sh
 ```
 
-With no arguments, the script uses defaults (`--all-enabled-regions --days 14 --output-dir ./reports`), which discovers every enabled Region and requires the `ec2:DescribeRegions` permission. Any arguments you pass are forwarded directly to the collector and replace the defaults, so all of the options documented later in this guide work through the script:
+With no arguments, the script uses the configured AWS Region and defaults to `--days 14 --output-dir ./reports`. If no Region is configured, supply `--regions`. Use `--all-enabled-regions` explicitly for broader discovery; it requires `ec2:DescribeRegions`. Arguments are forwarded directly to the collector and replace the script defaults:
 
 ```bash
 # Inventory and quotas only
@@ -76,8 +76,8 @@ To perform the steps yourself instead, continue with the manual instructions bel
 Run these commands in either environment:
 
 ```bash
-git clone https://github.com/dcabib/bedrock-quota-checker.git
-cd bedrock-quota-checker
+git clone https://github.com/aws-samples/sample-bedrock-quota-checker.git
+cd sample-bedrock-quota-checker
 python3 --version
 ```
 
@@ -196,17 +196,44 @@ Read inventory and metric identities without retrieving usage datapoints:
 python3 bedrock_access_report.py --regions us-east-1 --days 14 --plan
 ```
 
-The plan estimates the initial query workload. Identifiers with observed activity can require additional metric queries during a full run.
+The plan estimates the minimum number of daily-window requests, before additional pagination. Diagnostics take priority over tokens and activity, across all selected Regions. The newest daily windows are queried first. Increasing collection budgets can increase CloudWatch API charges.
 
-### Collect several Regions in parallel
+### Discover several Regions in parallel
 
-The collector queries Regions concurrently. By default it processes up to 4 Regions at a time; the global collection budgets (`--max-metrics`, `--max-datapoints`, `--max-metric-requests`) are shared across all Regions, so total cost stays capped regardless of parallelism.
+The collector inventories and discovers up to 4 Regions concurrently. History retrieval then runs in diagnostic priority order, rotating Regions within each daily window. The global collection budgets (`--max-metrics`, `--max-datapoints`, `--max-metric-requests`) apply to each attempt across all Regions.
 
 ```bash
 python3 bedrock_access_report.py --all-enabled-regions --region-workers 6
 ```
 
-Use `--region-workers 1` to collect Regions one at a time (the previous behavior). Higher values are faster but increase the risk of AWS API throttling.
+Use `--region-workers 1` to serialize inventory/discovery. Increasing worker count does not increase the history budgets.
+
+### Resume an incomplete report
+
+```bash
+python3 bedrock_access_report.py \
+  --resume ./reports/YOUR_REPORT_DIRECTORY/report.json \
+  --max-metric-requests 200 \
+  --output-dir ./reports
+```
+
+Resume uses AWS read APIs with the original account, Regions, time range and resolution. It preserves the inventory and quota snapshot timestamps, skips completed series/windows, retries incomplete windows and includes deferred metric identities. It writes a **new report directory**, preserving the source report. Each attempt gets a fresh collection budget; earlier issues are retained in `previous_attempts`.
+
+Reports from v0.1.2 have no completed-window checkpoints. Their incomplete series are queried again over the original window, with timestamp deduplication. Resume is rejected if CloudWatch retention no longer supports the saved resolution; collect a new report at a supported resolution instead. Controlled budget stops are resumable; this is not a checkpoint guarantee for a killed process.
+
+`--resume` does not refresh quotas or discover new resources. To update those, start a new collection.
+
+### Include inactive models or administrative API usage
+
+By default, history collection targets metric identities discovered by CloudWatch and explicit `--model-ids`. Runtime diagnostics are expanded before history retrieval, including account-level error/throttle queries in Regions with discovered Runtime metrics.
+
+```bash
+python3 bedrock_access_report.py \
+  --regions us-east-1 --days 14 \
+  --include-inactive-models --include-api-usage
+```
+
+`--include-inactive-models` also probes every catalog model/profile for historical activity. `--include-api-usage` includes administrative `AWS/Usage` metrics referenced by Service Quotas. Both options increase workload. `--model-ids` adds explicit Runtime identities and is **not** an exclusive filter.
 
 ### View a 30-day trend
 
@@ -232,7 +259,7 @@ This regenerates HTML, CSV, and ZIP outputs from the saved snapshot. It refreshe
 python3 bedrock_access_report.py --help
 ```
 
-Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--region-workers` for parallel Region collection, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
+Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--region-workers` for parallel discovery, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
 
 ## How to interpret the results
 
@@ -242,7 +269,10 @@ Additional options include explicit `--start` and `--end` timestamps, `--model-i
 - **Token utilization is an estimate.** Cache accounting, output-token factors, and upfront `max_tokens` reservations affect quota consumption. A low estimate does not rule out throttling.
 - **Missing data is not zero.** Retention, permissions, dimensions, discovery limits, and inactivity can all affect coverage.
 - **Endpoints are separate.** `bedrock-runtime` and `bedrock-mantle` have separate metrics and quota allocations.
-- **Some comparisons show `N/A`.** This version uses compatible Service Quotas usage metadata and two explicit mappings for US Claude Opus 4.7 and Haiku 4.5 profiles. Other unverified relationships remain unmapped. Even a mapped percentage describes the observed series, not guaranteed coverage of all traffic sharing the quota.
+- **Collection limits are not inference failures.** `request_budget_exhausted`, `datapoint_budget_exhausted` and `series_budget_exhausted` describe local collection limits. Incomplete series never receive a utilization percentage. Review coverage and resume before drawing conclusions.
+- **Some comparisons show `N/A`.** Validated Runtime mappings include US Opus 4.7 and Haiku 4.5, US/global Opus 4.8, Opus 5, Opus 5.5, Sonnet 5, GPT-6 Astra, and global Haiku 4.5. Mantle input/output mappings cover GPT-5.4, GPT-5.5, and GPT-5.6 Luna/Terra/Sol. Exact codes, names, scope and model identities must match. Unverified relationships remain unmapped.
+- **Daily quotas remain visible.** The report shows all quota types by default and highlights `Cross-Model Max Tokens Per Day`. Its pricing-based accounting cannot be reconstructed from raw token sums.
+- **Mantle HTTP 429 needs application evidence.** `InferenceClientErrors` excludes requests rejected before processing. Record HTTP status, error code, timestamp, model, Region, endpoint and request ID in application logs; aggregate token metrics cannot prove absence of throttling.
 
 See the [customer guide](docs/customer-guide.md) for permission details, metric limitations, and troubleshooting.
 

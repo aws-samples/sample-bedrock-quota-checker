@@ -15,7 +15,7 @@
 # none, sensible defaults are used (see DEFAULT_ARGS below).
 #
 # Examples:
-#   ./run.sh                                          # defaults: us-east-1 us-west-2, 14 days
+#   ./run.sh                                        # configured Region, 14 days
 #   ./run.sh --regions us-east-1 --skip-usage         # inventory and quotas only
 #   ./run.sh --profile customer-readonly --regions us-east-1 --days 30
 #
@@ -34,8 +34,8 @@ VENV="${VENV:-.venv}"
 COLLECTOR="bedrock_access_report.py"
 
 # Default collector arguments, used only when none are provided on the command line.
-# --all-enabled-regions discovers every enabled Region (requires ec2:DescribeRegions).
-DEFAULT_ARGS=(--all-enabled-regions --days 14 --output-dir ./reports)
+# Start in the configured Region. Broad discovery is an explicit option.
+DEFAULT_ARGS=(--days 14 --output-dir ./reports)
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -85,9 +85,9 @@ trap 'rm -f "$OUTPUT_LOG"' EXIT
 python3 "$COLLECTOR" "${ARGS[@]}" 2>&1 | tee "$OUTPUT_LOG"
 
 # Extract the absolute paths the collector printed (lines like "ZIP: /path/file.zip").
-HTML_PATH="$(grep -m1 '^HTML: '        "$OUTPUT_LOG" | sed 's/^HTML: //')"
-CSV_PATH="$(grep -m1 '^QUOTAS CSV: '   "$OUTPUT_LOG" | sed 's/^QUOTAS CSV: //')"
-ZIP_PATH="$(grep -m1 '^ZIP: '          "$OUTPUT_LOG" | sed 's/^ZIP: //')"
+HTML_PATH="$(grep -m1 '^HTML: '        "$OUTPUT_LOG" | sed 's/^HTML: //' || true)"
+CSV_PATH="$(grep -m1 '^QUOTAS CSV: '   "$OUTPUT_LOG" | sed 's/^QUOTAS CSV: //' || true)"
+ZIP_PATH="$(grep -m1 '^ZIP: '          "$OUTPUT_LOG" | sed 's/^ZIP: //' || true)"
 
 # Download instructions for AWS CloudShell.
 echo

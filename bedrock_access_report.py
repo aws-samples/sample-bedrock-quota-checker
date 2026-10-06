@@ -2,6 +2,7 @@
 """Read-only Bedrock inventory, quotas and CloudWatch history. No inference calls."""
 
 import argparse
+import copy
 import csv
 import io
 import json
@@ -10,17 +11,17 @@ import os
 from pathlib import Path
 import sys
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import zipfile
 import zlib
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 UTC = timezone.utc
 # Narrow mappings verified against quota definitions and system profile model IDs.
 # Names are guards against changed quota semantics, not fuzzy matching rules.
-TPM_RULES_VERSION = "2026-09-25.1"
+TPM_RULES_VERSION = "2026-10-06.1"
 TPM_RULES = {
     "L-5DB28B7B": (
         "Cross-region model inference tokens per minute for Anthropic Claude Opus 4.7",
@@ -31,6 +32,39 @@ TPM_RULES = {
         "us.anthropic.claude-haiku-4-5-20251001-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0",
     ),
 }
+# Exact quota codes, names and model identities; never infer a mapping from a
+# substring. Runtime profile destinations are also checked in analyze().
+for _code, _name, _profile, _model in (
+    ("L-A4430697", "Cross-region model inference tokens per minute for Anthropic Claude Opus 5.5", "us.anthropic.claude-opus-5-5", "anthropic.claude-opus-5-5"),
+    ("L-A103A344", "Global cross-region model inference tokens per minute for Anthropic Claude Opus 5.5", "global.anthropic.claude-opus-5-5", "anthropic.claude-opus-5-5"),
+    ("L-99296DCD", "Cross-region model inference tokens per minute for Anthropic Claude Opus 5", "us.anthropic.claude-opus-5", "anthropic.claude-opus-5"),
+    ("L-D73B1244", "Global cross-region model inference tokens per minute for Anthropic Claude Opus 5", "global.anthropic.claude-opus-5", "anthropic.claude-opus-5"),
+    ("L-DB99DCDB", "Cross-region model inference tokens per minute for Anthropic Claude Opus 4.8", "us.anthropic.claude-opus-4-8", "anthropic.claude-opus-4-8"),
+    ("L-4FCE27C7", "Global cross-region model inference tokens per minute for Anthropic Claude Opus 4.8", "global.anthropic.claude-opus-4-8", "anthropic.claude-opus-4-8"),
+    ("L-9A11C666", "Global cross-region model inference tokens per minute for Anthropic Claude Haiku 4.5", "global.anthropic.claude-haiku-4-5-20251001-v1:0", "anthropic.claude-haiku-4-5-20251001-v1:0"),
+    ("L-D4FBCF4E", "Cross-region model inference tokens per minute for Anthropic Claude Sonnet 5", "us.anthropic.claude-sonnet-5", "anthropic.claude-sonnet-5"),
+    ("L-DD84E5CA", "Global cross-region model inference tokens per minute for Anthropic Claude Sonnet 5", "global.anthropic.claude-sonnet-5", "anthropic.claude-sonnet-5"),
+    ("L-B38B530A", "Global cross-region model inference tokens per minute for GPT-6 Astra", "global.openai.gpt-6-astra", "openai.gpt-6-astra"),
+    ("L-53A144CD", "Cross-region model inference tokens per minute for GPT-6 Astra", "us.openai.gpt-6-astra", "openai.gpt-6-astra"),
+):
+    TPM_RULES[_code] = (_name, _profile, _model)
+
+MANTLE_RULES = {}
+for _name, _model, _input, _output in (
+    ("GPT-5.6 Luna", "openai.gpt-5.6-luna", "L-31615887", "L-D44E1D4E"),
+    ("GPT-5.6 Terra", "openai.gpt-5.6-terra", "L-87594EB7", "L-574688BD"),
+    ("GPT-5.6 Sol", "openai.gpt-5.6-sol", "L-137DD3C2", "L-C2E494BA"),
+    ("GPT-5.5", "openai.gpt-5.5", "L-2555C05B", "L-8A643E07"),
+    ("GPT-5.4", "openai.gpt-5.4", "L-C593EA7C", "L-08036ECB"),
+):
+    for _code, _direction, _metric in (
+        (_input, "Input", "TotalInputTokens"), (_output, "Output", "TotalOutputTokens"),
+    ):
+        MANTLE_RULES[_code] = (
+            f"[bedrock-mantle endpoint] {_direction} tokens per minute for {_name}",
+            _model, _metric,
+        )
+
 REPORT_LIMITATIONS = (
     "Quotas are a current snapshot; they do not reconstruct historical limits.",
     "Reported availability does not test the application's effective invocation permissions.",
@@ -40,6 +74,9 @@ REPORT_LIMITATIONS = (
     "Percentages are calculated only when the quota mapping and units are confirmed.",
     "Totals from series with different dimensions are not added together, to avoid double counting.",
     "Mantle has its own namespace and quotas. Missing series do not prove that there was no usage.",
+    "Mantle InferenceClientErrors excludes quota-related HTTP 429 responses rejected before processing. Inspect application HTTP status/error logs.",
+    "Cross-Model Max Tokens Per Day uses pricing-based accounting, not a raw sum of token metrics; its utilization is not calculated here.",
+    "Budget exhaustion is a local collection limit, not an AWS inference error. Resume incomplete queries before interpreting missing diagnostics.",
     "This collection covers only the listed Regions; global quotas may have additional usage from other source Regions.",
 )
 RUNTIME_METRICS = (
@@ -48,6 +85,9 @@ RUNTIME_METRICS = (
     "InvocationClientErrors", "InvocationServerErrors", "OutputImageCount",
 )
 MANTLE_METRICS = ("Inferences", "TotalInputTokens", "TotalOutputTokens", "InferenceClientErrors")
+DIAGNOSTIC_METRICS = ("InvocationThrottles", "InvocationClientErrors", "InvocationServerErrors", "InferenceClientErrors")
+BATCH_SIZE = 50
+CHUNK_SECONDS = 86400
 ALLOWED_OPERATIONS = {
     "sts": {"get_caller_identity"},
     "bedrock": {
@@ -117,6 +157,39 @@ def metric_id(region, metric, stat="Sum"):
     return f"m{zlib.crc32(payload) & 0xffffffff:08x}{zlib.adler32(payload) & 0xffffffff:08x}"
 
 
+def metric_priority(item):
+    metric = item["metric"]
+    if metric["MetricName"] in DIAGNOSTIC_METRICS:
+        return 0
+    if metric["Namespace"] == "AWS/Usage":
+        return 3
+    if item.get("sources") == ["known_model_id"]:
+        return 2
+    return 1
+
+
+def covered(item, start, end):
+    """Only explicitly completed query ranges establish coverage, not datapoints."""
+    cursor = iso(start)
+    for left, right in sorted(item.get("completed_windows", [])):
+        if left > cursor:
+            break
+        cursor = max(cursor, right)
+        if cursor >= iso(end):
+            return True
+    return False
+
+
+def complete_window(item, start, end):
+    merged = []
+    for left, right in sorted(item.get("completed_windows", []) + [[iso(start), iso(end)]]):
+        if merged and left <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    item["completed_windows"] = merged
+
+
 def window(args, now=None):
     now = now or datetime.now(UTC)
 
@@ -184,10 +257,12 @@ class Collector:
             "regions": [], "models": [], "inference_profiles": [], "provisioned_throughput": [],
             "quotas": [], "metrics": [], "collection_issues": [], "collections": [],
             "query_plan": [], "usage_skipped": args.skip_usage or args.plan,
+            "deferred_metrics": [],
             "limitations": list(REPORT_LIMITATIONS),
         }
         self.metric_calls = 0
         self.returned_points = 0
+        self.selected_count = 0
 
     def client(self, service, region):
         key = service, region
@@ -204,18 +279,29 @@ class Collector:
             return self.clients[key]
 
     def reserve_metrics(self, candidates):
-        """Atomically claim series against the global --max-metrics budget.
-
-        Truncates `candidates` to the remaining budget, appends the survivors to
-        self.report["metrics"] under the lock, and returns them. Doing the check
-        and the append together prevents concurrent Regions from jointly exceeding
-        the cap.
-        """
+        """Reserve an attempt's series budget; retain deferred identities for resume."""
         with self.lock:
-            remaining = max(0, self.args.max_metrics - len(self.report["metrics"]))
+            remaining = max(0, self.args.max_metrics - self.selected_count)
             selected = candidates[:remaining]
-            self.report["metrics"].extend(selected)
+            self.selected_count += len(selected)
+            existing = {m["id"] for m in self.report["metrics"]}
+            self.report["metrics"].extend(m for m in selected if m["id"] not in existing)
+            deferred = {m["id"]: m for m in self.report.get("deferred_metrics", [])}
+            for item in candidates[remaining:]:
+                item["status_reason"] = "series_budget_exhausted"
+                if item["id"] not in existing:
+                    deferred[item["id"]] = item
+            for item in selected:
+                deferred.pop(item["id"], None)
+            self.report["deferred_metrics"] = list(deferred.values())
             return selected
+
+    def budget_reason(self):
+        if self.metric_calls >= self.args.max_metric_requests:
+            return "request_budget_exhausted"
+        if self.returned_points >= self.args.max_datapoints:
+            return "datapoint_budget_exhausted"
+        return None
 
     def reserve_metric_request(self):
         """Atomically claim one GetMetricData call against --max-metric-requests.
@@ -349,9 +435,25 @@ class Collector:
             for metric in rows:
                 if metric["MetricName"] in names:
                     add(metric, "ListMetrics")
+        # Prepare model diagnostics before any history retrieval. Discovery of
+        # activity identifies useful dimensions even when history is expensive.
+        for item in list(candidates.values()):
+            metric = item["metric"]
+            dims = metric["Dimensions"]
+            namespace = metric["Namespace"]
+            if len(dims) == 1 and dims[0]["Name"] == ("ModelId" if namespace == "AWS/Bedrock" else "Model"):
+                for name in RUNTIME_METRICS if namespace == "AWS/Bedrock" else MANTLE_METRICS:
+                    add({"Namespace": namespace, "MetricName": name, "Dimensions": dims}, "discovered_id_expansion")
+        # Account-level diagnostics include failures without a resolved ModelId.
+        if (any(m["metric"]["Namespace"] == "AWS/Bedrock" for m in candidates.values())
+                or self.args.model_ids or getattr(self.args, "include_inactive_models", False)):
+            for name in RUNTIME_METRICS:
+                add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": []}, "account_probe")
         for quota in self.report["quotas"]:
             usage = quota.get("usage_metric")
             if quota["region"] != region or not usage:
+                continue
+            if usage["MetricNamespace"] == "AWS/Usage" and not getattr(self.args, "include_api_usage", False):
                 continue
             stat = usage.get("MetricStatisticRecommendation")
             if stat not in ("Sum", "Maximum", "Minimum", "Average", "SampleCount"):
@@ -363,28 +465,33 @@ class Collector:
             add(metric, "ServiceQuotas.UsageMetric", stat)
             quota["usage_metric_id"] = metric_id(region, metric, stat)
         # Query documented ModelId series even if ListMetrics has not listed them.
-        known_ids = set(self.args.model_ids or [])
-        known_ids.update(m["modelId"] for m in self.report["models"] if m["region"] == region)
-        known_ids.update(p["inferenceProfileId"] for p in self.report["inference_profiles"] if p["region"] == region)
-        known_ids.update(p["provisionedModelArn"] for p in self.report["provisioned_throughput"] if p["region"] == region)
+        for model_id_value in self.args.model_ids or []:
+            for name in RUNTIME_METRICS:
+                add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": [
+                    {"Name": "ModelId", "Value": model_id_value},
+                ]}, "explicit_model_id")
+        known_ids = set()
+        if getattr(self.args, "include_inactive_models", False):
+            known_ids.update(m["modelId"] for m in self.report["models"] if m["region"] == region)
+            known_ids.update(p["inferenceProfileId"] for p in self.report["inference_profiles"] if p["region"] == region)
+            known_ids.update(p["provisionedModelArn"] for p in self.report["provisioned_throughput"] if p["region"] == region)
         for model_id_value in sorted(known_ids):
             # First probe one activity counter; expand historical IDs only when data exists.
             add({"Namespace": "AWS/Bedrock", "MetricName": "Invocations", "Dimensions": [
                 {"Name": "ModelId", "Value": model_id_value},
             ]}, "known_model_id")
-        # Reserve series against the shared --max-metrics budget and append them
-        # atomically, so parallel Regions cannot jointly exceed the global cap.
-        all_candidates = list(candidates.values())
-        selected = self.reserve_metrics(all_candidates)
-        if len(selected) != len(all_candidates):
-            self.issue(region, "query_plan", "partial", f"Global limit of {self.args.max_metrics} series reached: {len(all_candidates)-len(selected)} series were not queried.")
+        # Reserve only after all Regions have been discovered, in priority order.
+        selected = sorted(candidates.values(), key=lambda m: (metric_priority(m), m["id"]))
         discovered = sum("ListMetrics" in m["sources"] for m in selected)
         plan = {
             "region": region, "series": len(selected), "discovered_series": discovered,
             "known_id_probes": sum("known_model_id" in m["sources"] for m in selected),
             "period_seconds": self.period,
             "max_possible_points": len(selected) * int((self.end-self.start).total_seconds()/self.period),
-            "initial_get_metric_data_requests": math.ceil(len(selected)/100),
+            "minimum_window_requests": sum(
+                math.ceil(sum(metric_priority(m) == priority for m in selected)/BATCH_SIZE)
+                for priority in range(4)
+            ) * math.ceil((self.end-self.start).total_seconds()/CHUNK_SECONDS),
         }
         with self.lock:
             self.report["query_plan"].append(plan)
@@ -396,7 +503,7 @@ class Collector:
         # appending to it concurrently.
         with self.lock:
             snapshot = list(self.report["metrics"])
-        existing = {m["id"] for m in snapshot}
+        existing = {m["id"] for m in snapshot + self.report.get("deferred_metrics", [])}
         candidates = []
         for observed in snapshot:
             if observed["region"] != region or not observed["points"]:
@@ -423,100 +530,137 @@ class Collector:
                     "period_seconds": self.period, "sources": ["observed_id_expansion"],
                     "points": [], "status": "not_queried", "messages": [],
                 })
-        # Claim the candidates against the shared budget atomically.
-        additional = self.reserve_metrics(candidates)
-        if len(additional) != len(candidates):
-            self.issue(region, "expand_observed", "partial", "Series limit reached while expanding identifiers with observed usage.")
-        if additional:
-            print(f"[{region}] Querying {len(additional)} additional series for IDs with observed usage.", flush=True)
-        return additional
+        return candidates
 
     def fetch_metrics(self, region, metrics):
-        for offset in range(0, len(metrics), 100):
-            batch = metrics[offset:offset+100]
-            points = {m["id"]: {} for m in batch}
-            states = {}
-            lookup = {m["id"]: m for m in batch}
-            query = {
-                "StartTime": self.start, "EndTime": self.end, "ScanBy": "TimestampAscending",
-                "MaxDatapoints": 100800,
-                "MetricDataQueries": [{
-                    "Id": m["id"], "MetricStat": {"Metric": m["metric"], "Period": self.period, "Stat": m["stat"]},
-                    "ReturnData": True,
-                } for m in batch],
-            }
-            seen_tokens, complete = set(), True
-            while True:
-                # Atomically claim one request against the shared call/datapoint
-                # budgets so parallel Regions cannot jointly exceed them.
-                if not self.reserve_metric_request():
-                    self.issue(region, "get_metric_data", "partial", "Query or datapoint limit reached; results are partial.")
-                    complete = False
-                    break
-                response = self.call("cloudwatch", region, "get_metric_data", **query)
-                if response is None:
-                    complete = False
-                    break
-                for message in response.get("Messages", []):
-                    self.issue(region, "get_metric_data", "partial", message.get("Value", message))
-                    complete = False
-                new_points = 0
-                for result in response.get("MetricDataResults", []):
-                    key = result["Id"]
-                    if key not in lookup:
+        """Compatibility entry point for one Region; run() schedules all Regions."""
+        for item in metrics:
+            item.setdefault("region", region)
+        self.fetch_scheduled(metrics)
+
+    def fetch_scheduled(self, metrics):
+        """Diagnostics first; newest daily window first; rotate Regions per window."""
+        groups = defaultdict(list)
+        for item in metrics:
+            if item.get("status") in ("ok", "no_data"):
+                continue
+            item["messages"] = []
+            item.pop("status_reason", None)
+            groups[(metric_priority(item), item["region"])].append(item)
+        for priority in sorted({key[0] for key in groups}):
+            end = self.end
+            while end > self.start:
+                start = max(self.start, end-timedelta(seconds=CHUNK_SECONDS))
+                regional_batches = {}
+                for rank, region in sorted(groups, key=lambda k: (k[0], region_sort_key(k[1]))):
+                    if rank != priority:
                         continue
-                    # PartialData is expected on intermediate pages. The final state wins.
-                    states[key] = result.get("StatusCode", "Unknown")
-                    lookup[key]["messages"].extend(result.get("Messages", []))
-                    for timestamp, value in zip(result.get("Timestamps", []), result.get("Values", [])):
-                        if self.start <= timestamp < self.end and math.isfinite(value):
-                            stamp = iso(timestamp)
-                            if stamp not in points[key]:
-                                new_points += 1
-                            points[key][stamp] = value
-                # Flush this response's datapoints to the shared counter so the
-                # cross-Region budget check stays accurate.
-                if new_points:
-                    self.add_returned_points(new_points)
-                token = response.get("NextToken")
-                if not token:
-                    break
-                if token in seen_tokens:
-                    self.issue(region, "get_metric_data", "partial", "Repeated pagination token.")
-                    complete = False
-                    break
-                seen_tokens.add(token)
-                query["NextToken"] = token
-            for metric in batch:
-                key = metric["id"]
-                metric["points"] = [[stamp, value] for stamp, value in sorted(points[key].items())]
-                code = states.get(key, "MissingResult")
-                if not complete or code != "Complete" or metric["messages"]:
-                    metric["status"] = "partial" if metric["points"] else "error"
-                    if code != "Complete" or metric["messages"]:
-                        self.issue(region, "get_metric_data", metric["status"], f"Final status: {code}. {metric['messages']}", key)
-                else:
-                    metric["status"] = "ok" if metric["points"] else "no_data"
-            if self.metric_calls >= self.args.max_metric_requests or self.returned_points >= self.args.max_datapoints:
-                if offset+len(batch) < len(metrics):
-                    self.issue(region, "get_metric_data", "partial", f"Query/datapoint limit reached; {len(metrics)-offset-len(batch)} series were not queried.")
+                    pending = [m for m in groups[(rank, region)] if not covered(m, start, end)]
+                    regional_batches[region] = [pending[i:i+BATCH_SIZE] for i in range(0, len(pending), BATCH_SIZE)]
+                for index in range(max((len(v) for v in regional_batches.values()), default=0)):
+                    for region, batches in regional_batches.items():
+                        if index >= len(batches):
+                            continue
+                        if self.budget_reason():
+                            self.mark_budget_stop(metrics)
+                            return
+                        self.fetch_window(region, batches[index], start, end)
+                        if self.budget_reason() and any(m.get("status") not in ("ok", "no_data") for m in metrics):
+                            self.mark_budget_stop(metrics)
+                            return
+                end = start
+
+    def mark_budget_stop(self, metrics):
+        reason = self.budget_reason()
+        for item in metrics:
+            if item.get("status") not in ("ok", "no_data") and not item.get("status_reason"):
+                item["status"] = "partial" if item["points"] or item.get("completed_windows") else "not_queried"
+                item["status_reason"] = reason
+        self.issue("all", "get_metric_data", "partial",
+                   f"Local {reason}: {self.metric_calls}/{self.args.max_metric_requests} requests, "
+                   f"{self.returned_points}/{self.args.max_datapoints} datapoints. Resume the saved report.")
+
+    def fetch_window(self, region, batch, start, end):
+        points = {m["id"]: dict(m["points"]) for m in batch}
+        received = set()
+        states, messages = {}, defaultdict(list)
+        lookup = {m["id"]: m for m in batch}
+        query = {
+            "StartTime": start, "EndTime": end, "ScanBy": "TimestampDescending",
+            "MaxDatapoints": min(100800, self.args.max_datapoints-self.returned_points),
+            "MetricDataQueries": [{
+                "Id": m["id"], "MetricStat": {"Metric": m["metric"], "Period": self.period, "Stat": m["stat"]},
+                "ReturnData": True,
+            } for m in batch],
+        }
+        seen_tokens, failure, attempted = set(), None, False
+        while True:
+            if not self.reserve_metric_request():
+                failure = self.budget_reason()
                 break
-            if offset % 500 == 0 or offset+100 >= len(metrics):
-                print(f"[{region}] History: {min(offset+100,len(metrics))}/{len(metrics)} series, {self.returned_points:,} datapoints.", flush=True)
+            attempted = True
+            response = self.call("cloudwatch", region, "get_metric_data", **query)
+            if response is None:
+                failure = "api_error"
+                break
+            for message in response.get("Messages", []):
+                self.issue(region, "get_metric_data", "partial", message.get("Value", message))
+                failure = "service_message"
+            new_points = 0
+            for result in response.get("MetricDataResults", []):
+                key = result["Id"]
+                if key not in lookup:
+                    continue
+                states[key] = result.get("StatusCode", "Unknown")
+                messages[key].extend(result.get("Messages", []))
+                for timestamp, value in zip(result.get("Timestamps", []), result.get("Values", [])):
+                    if start <= timestamp < end and math.isfinite(value):
+                        stamp = iso(timestamp)
+                        if (key, stamp) not in received:
+                            new_points += 1
+                            received.add((key, stamp))
+                        points[key][stamp] = value
+            self.add_returned_points(new_points)
+            token = response.get("NextToken")
+            if not token:
+                break
+            if token in seen_tokens:
+                failure = "repeated_pagination_token"
+                self.issue(region, "get_metric_data", "partial", "Repeated pagination token.")
+                break
+            seen_tokens.add(token)
+            query["NextToken"] = token
+        for item in batch:
+            key = item["id"]
+            item["points"] = [[t, v] for t, v in sorted(points[key].items())]
+            item.setdefault("messages", []).extend(messages[key])
+            code = states.get(key, "MissingResult")
+            if failure is None and code == "Complete" and not messages[key]:
+                complete_window(item, start, end)
+            elif failure in ("request_budget_exhausted", "datapoint_budget_exhausted"):
+                item["status_reason"] = failure
+            else:
+                item["status_reason"] = failure or code
+                if attempted:
+                    self.issue(region, "get_metric_data", "partial" if item["points"] else "error",
+                               f"{iso(start)} to {iso(end)}: {failure or code}. {messages[key]}", key)
+            if covered(item, self.start, self.end):
+                item["status"] = "ok" if item["points"] else "no_data"
+                item.pop("status_reason", None)
+            elif item["points"] or item.get("completed_windows"):
+                item["status"] = "partial"
+            elif item.get("status_reason") in ("request_budget_exhausted", "datapoint_budget_exhausted"):
+                item["status"] = "not_queried"
+            else:
+                item["status"] = "error"
 
     def collect_region(self, region):
-        """Collect everything for a single Region. Safe to run concurrently:
-        shared budgets and counters are guarded by self.lock, and the report
-        lists are only appended to (atomic under the GIL)."""
+        """Discover inventory and candidates without spending the history budget."""
         self.inventory(region)
         self.quotas(region)
         if not self.args.skip_usage:
-            metrics = self.discover(region)
-            if not self.args.plan:
-                self.fetch_metrics(region, metrics)
-                extra = self.expand_observed(region)
-                if extra:
-                    self.fetch_metrics(region, extra)
+            return self.discover(region)
+        return []
 
     def run(self, regions):
         identity = self.call("sts", regions[0], "get_caller_identity")
@@ -530,10 +674,11 @@ class Collector:
         # Collect Regions concurrently. Global budgets (--max-metrics,
         # --max-datapoints, --max-metric-requests) remain shared across all
         # Regions via atomic reservations, so total cost stays capped.
+        candidates = []
         workers = max(1, min(self.args.region_workers, len(regions)))
         if workers == 1 or len(regions) == 1:
             for region in regions:
-                self.collect_region(region)
+                candidates.extend(self.collect_region(region))
         else:
             print(f"Collecting {len(regions)} Regions with up to {workers} in parallel.", flush=True)
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -542,13 +687,67 @@ class Collector:
                     region = futures[future]
                     # Surface unexpected failures without aborting the other Regions.
                     try:
-                        future.result()
+                        candidates.extend(future.result())
                     except Exception as exc:
                         self.issue(region, "collect_region", "error", f"Region collection failed: {exc}")
                         print(f"[{region}] Collection failed: {exc}", flush=True)
+        self.collect_candidates(candidates)
+        return self.finish()
+
+    def collect_candidates(self, candidates):
+        candidates.sort(key=lambda m: (metric_priority(m), region_sort_key(m["region"]), m["id"]))
+        selected = self.reserve_metrics(candidates)
+        if len(selected) < len(candidates):
+            self.issue("all", "query_plan", "partial",
+                       f"Local series budget exhausted: {len(candidates)-len(selected)} series deferred. Resume to collect them.")
+        if not self.args.skip_usage and not self.args.plan:
+            self.fetch_scheduled(selected)
+            # Inactive catalog probes may discover historical identifiers.
+            extra = [m for region in self.report["regions"] for m in self.expand_observed(region)]
+            if extra:
+                extra.sort(key=lambda m: (metric_priority(m), region_sort_key(m["region"]), m["id"]))
+                self.fetch_scheduled(self.reserve_metrics(extra))
+
+    def resume(self, saved):
+        """Reuse inventory, retry incomplete windows, and write a new report later."""
+        if not saved.get("metrics") and not saved.get("deferred_metrics"):
+            raise ValueError("The report has no saved metric identities. Start a new usage collection.")
+        regions = saved["regions"]
+        identity = self.call("sts", regions[0], "get_caller_identity")
+        if identity is None or identity["Account"] != saved["account_id"] or identity["Arn"].split(":")[1] != saved["partition"]:
+            raise ValueError("Resume requires credentials for the original account and partition.")
+        self.report = copy.deepcopy(saved)
+        self.report.setdefault("previous_attempts", []).append({
+            "completed_at": saved.get("completed_at"),
+            "collector_version": saved.get("resume_collector_version", saved["collector_version"]),
+            "collection_settings": saved.get("collection_settings"),
+            "api_calls": saved.get("api_calls", {}), "collection_issues": saved["collection_issues"],
+        })
+        self.report["collection_issues"] = [
+            i for i in saved["collection_issues"]
+            if i["operation"] not in ("get_metric_data", "query_plan", "expand_observed")
+        ]
+        self.report["profile"] = self.args.profile or "credential-chain"
+        self.report["usage_skipped"] = False
+        self.report["resumed_at"] = iso(datetime.now(UTC))
+        self.report["resume_collector_version"] = VERSION
+        candidates = [m for m in self.report["metrics"] if m["status"] not in ("ok", "no_data")]
+        candidates.extend(self.report.get("deferred_metrics", []))
+        self.collect_candidates(candidates)
+        return self.finish()
+
+    def finish(self):
         self.report["completed_at"] = iso(datetime.now(UTC))
         self.report["api_calls"] = dict(self.calls)
-        self.report["returned_datapoints"] = self.returned_points
+        self.report["returned_datapoints"] = sum(len(m["points"]) for m in self.report["metrics"])
+        self.report["collection_settings"] = {
+            "max_metrics": self.args.max_metrics, "max_metric_requests": self.args.max_metric_requests,
+            "max_datapoints": self.args.max_datapoints, "selected_series": self.selected_count,
+            "metric_requests_used": self.metric_calls, "datapoints_received": self.returned_points,
+            "batch_size": BATCH_SIZE, "window_seconds": CHUNK_SECONDS, "scan_by": "TimestampDescending",
+            "include_inactive_models": getattr(self.args, "include_inactive_models", False),
+            "include_api_usage": getattr(self.args, "include_api_usage", False),
+        }
         self.report = serializable(self.report)
         analyze(self.report)
         return self.report
@@ -578,6 +777,12 @@ def analyze(report):
     by_id = {m["id"]: m for m in report["metrics"]}
     for quota in report["quotas"]:
         quota["comparison"] = {"status":"unmapped", "reason":"No confirmed mapping between this quota and a usage series."}
+        if quota["quota_code"] == "L-E3F10727" and quota["name"] == "Cross-Model Max Tokens Per Day":
+            quota["comparison"] = {
+                "status": "unsupported",
+                "reason": "Daily pricing-based quota. Raw token counts and EstimatedTPMQuotaUsage cannot establish its consumption. Obtain quota-specific evidence from AWS Support and application errors.",
+            }
+            continue
         metric = by_id.get(quota.get("usage_metric_id"))
         if not metric:
             continue
@@ -587,9 +792,10 @@ def analyze(report):
         duration = period.get("PeriodValue", 0) * {"SECOND":1, "MINUTE":60, "HOUR":3600, "DAY":86400}.get(period.get("PeriodUnit"), 0)
         if (duration == 60 and metric["stat"] == "Sum" and not quota["global"] and
                 quota.get("unit") in ("Count", "None") and quota["applied_value"] is not None and
-                quota["applied_value"] > 0 and metric["status"] == "ok"):
+                quota["applied_value"] > 0 and metric["status"] == "ok" and metric["summary"]["peak_per_minute"] is not None):
             quota["comparison"] = {
                 "status": "estimated", "source": "ServiceQuotas.UsageMetric",
+                "metric_id": metric["id"], "peak_per_minute": metric["summary"]["peak_per_minute"],
                 "reason": "Observed usage normalized per minute against the current quota; it may differ from the occupancy used for throttling.",
                 "peak_percent": 100 * metric["summary"]["peak_per_minute"] / quota["applied_value"],
             }
@@ -605,7 +811,10 @@ def analyze(report):
             "Namespace":"AWS/Bedrock", "MetricName":"EstimatedTPMQuotaUsage",
             "Dimensions":[{"Name":"ModelId","Value":rule[1]}],
         }))
-        if len(profiles) != 1 or not metric or metric["status"] != "ok" or not quota["applied_value"] or quota["applied_value"] < 0:
+        if len(profiles) != 1 or not metric or metric["stat"] != "Sum" or not quota["applied_value"] or quota["applied_value"] < 0:
+            continue
+        if metric["status"] != "ok":
+            quota["comparison"] = {"status": "incomplete", "reason": "The model/profile mapping is validated, but the usage query is incomplete or has no datapoints. Resume collection before comparing utilization."}
             continue
         peak = metric["summary"]["peak_per_minute"]
         quota["comparison"] = {
@@ -615,6 +824,39 @@ def analyze(report):
             "p95_percent":100*metric["summary"]["p95_per_minute"]/quota["applied_value"],
             "reason":"Peak for this profile's series against the current quota. This estimate excludes upfront reservations and does not guarantee coverage of other profiles sharing the quota.",
         }
+    for quota in report["quotas"]:
+        rule = MANTLE_RULES.get(quota["quota_code"])
+        if not rule or quota["name"] != rule[0] or quota["level"] != "ACCOUNT" or quota["global"] or quota["context"]:
+            continue
+        metric = by_id.get(metric_id(quota["region"], {
+            "Namespace": "AWS/BedrockMantle", "MetricName": rule[2],
+            "Dimensions": [{"Name": "Model", "Value": rule[1]}],
+        }))
+        if not metric or metric["stat"] != "Sum" or not quota["applied_value"] or quota["applied_value"] < 0:
+            continue
+        if metric["status"] != "ok":
+            quota["comparison"] = {"status": "incomplete", "reason": "The Mantle model and token direction are mapped, but the usage query is incomplete or has no datapoints."}
+            continue
+        peak = metric["summary"]["peak_per_minute"]
+        quota["comparison"] = {
+            "status": "estimated", "source": f"AWS/BedrockMantle.{rule[2]}",
+            "rule_version": TPM_RULES_VERSION, "metric_id": metric["id"],
+            "peak_per_minute": peak, "peak_percent": 100*peak/quota["applied_value"],
+            "p95_percent": 100*metric["summary"]["p95_per_minute"]/quota["applied_value"],
+            "reason": "Observed billable tokens against the matching Mantle input/output quota in this Region. Cached input accounting and upfront reservations can differ. HTTP 429 responses require application logs; low observed usage does not rule out throttling.",
+        }
+    report["diagnostic_coverage"] = []
+    for region in report.get("regions", []):
+        metrics = [m for m in report["metrics"] if m["region"] == region]
+        throttles = [m for m in metrics if m["metric"]["Namespace"] == "AWS/Bedrock" and m["metric"]["MetricName"] == "InvocationThrottles"]
+        report["diagnostic_coverage"].append({
+            "region": region,
+            "runtime_throttle_series": len(throttles),
+            "runtime_throttle_queries_complete": sum(m["status"] in ("ok", "no_data") for m in throttles),
+            "incomplete_series": sum(m["status"] not in ("ok", "no_data") for m in metrics),
+            "deferred_series": sum(m["region"] == region for m in report.get("deferred_metrics", [])),
+            "mantle_requires_application_errors": any(m["metric"]["Namespace"] == "AWS/BedrockMantle" for m in metrics),
+        })
 
 
 def safe_csv_value(value):
@@ -660,10 +902,11 @@ def export(report, directory, collect_only=False):
             "id": metric["id"], "region": metric["region"], "namespace": metric["metric"]["Namespace"],
             "metric": metric["metric"]["MetricName"], "dimensions": metric["metric"]["Dimensions"],
             "stat": metric["stat"], "period_seconds": metric["period_seconds"], "status": metric["status"],
+            "status_reason": metric.get("status_reason"), "completed_windows": metric.get("completed_windows", []),
             **metric.get("summary", {}),
         })
     atomic_text(directory/"usage_summary.csv", csv_text(rows, [
-        "id", "region", "namespace", "metric", "dimensions", "stat", "period_seconds", "status",
+        "id", "region", "namespace", "metric", "dimensions", "stat", "period_seconds", "status", "status_reason", "completed_windows",
         "total", "max", "p95", "peak_per_minute", "p95_per_minute", "observed_points", "expected_intervals", "missing_intervals",
     ]))
     def points():
@@ -720,15 +963,19 @@ def parser():
     result.add_argument("--end", help="History end in ISO 8601 format (default: five minutes ago)")
     result.add_argument("--period", default="auto", choices=["auto", "60", "300", "3600"], help="Metric period in seconds; auto respects retention")
     result.add_argument("--model-ids", nargs="+", help="Additional runtime metric IDs to query")
+    result.add_argument("--include-inactive-models", action="store_true", help="Also probe the entire catalog for historical activity (higher collection cost)")
+    result.add_argument("--include-api-usage", action="store_true", help="Also collect administrative AWS/Usage metrics referenced by quotas")
     result.add_argument("--output-dir", default="./reports", help="Parent directory for generated reports (default: ./reports)")
-    result.add_argument("--region-workers", type=int, default=4, help="Regions to collect in parallel; global budgets stay shared (default: 4, use 1 to serialize)")
+    result.add_argument("--region-workers", type=int, default=4, help="Parallel inventory/discovery workers; history is scheduled by diagnostic priority (default: 4)")
     result.add_argument("--skip-usage", action="store_true", help="Collect inventory and quotas without CloudWatch metric queries")
     result.add_argument("--plan", action="store_true", help="Read inventory/metric identities without fetching datapoints")
-    result.add_argument("--max-metrics", type=int, default=3000, help="Maximum selected series per run (default: 3000)")
+    result.add_argument("--max-metrics", type=int, default=3000, help="Maximum selected series per attempt; deferred identities are saved for resume (default: 3000)")
     result.add_argument("--max-datapoints", type=int, default=2000000, help="Returned datapoint limit, checked between responses (default: 2000000)")
     result.add_argument("--max-metric-requests", type=int, default=200, help="Maximum GetMetricData calls per run (default: 200)")
     result.add_argument("--collect-only", action="store_true", help="Save data without rendering HTML")
-    result.add_argument("--render", metavar="REPORT_JSON", help="Regenerate exports from saved data, without AWS calls")
+    saved = result.add_mutually_exclusive_group()
+    saved.add_argument("--render", metavar="REPORT_JSON", help="Regenerate exports from saved data, without AWS calls")
+    saved.add_argument("--resume", metavar="REPORT_JSON", help="Retry incomplete usage windows in the original account; save a new report")
     result.add_argument("--version", action="version", version=VERSION)
     return result
 
@@ -752,13 +999,26 @@ def main():
         raise ValueError("--plan and --skip-usage cannot be used together.")
     if args.days <= 0 or min(args.max_metrics, args.max_datapoints, args.max_metric_requests) <= 0:
         raise ValueError("Days and collection limits must be positive.")
-    start, end, period = window(args)
+    saved_report = None
+    if args.resume:
+        if args.skip_usage or args.plan or args.regions or args.all_enabled_regions or args.start or args.end or args.period != "auto" or args.model_ids or args.days != 14:
+            raise ValueError("--resume preserves the original Regions, time window, resolution and metric identities. Do not combine it with collection scope options.")
+        saved_report = json.loads(Path(args.resume).expanduser().read_text())
+        if saved_report.get("schema_version") != "1.0":
+            raise ValueError("Unsupported report schema.")
+        resume_args = copy.copy(args)
+        resume_args.start, resume_args.end = saved_report["start"], saved_report["end"]
+        resume_args.period = str(saved_report["period_seconds"])
+        # Reject a resume when retention no longer supports the saved resolution.
+        start, end, period = window(resume_args)
+    else:
+        start, end, period = window(args)
     try:
         import boto3
     except ImportError as exc:
         raise RuntimeError("Install boto3 in your Python environment before running the collector.") from exc
     session = boto3.Session(profile_name=args.profile)
-    regions = list(dict.fromkeys(args.regions or [session.region_name]))
+    regions = saved_report["regions"] if saved_report else list(dict.fromkeys(args.regions or [session.region_name]))
     if not regions[0]:
         raise ValueError("No Region configured. Provide --regions or configure a Region in the profile.")
     collector = Collector(session, args, start, end, period)
@@ -773,7 +1033,7 @@ def main():
     # Order Regions by display priority so the HTML Overview and its Region
     # selector lead with us-east-1, then North America, Europe, South America.
     regions = order_regions(regions)
-    report = collector.run(regions)
+    report = collector.resume(saved_report) if saved_report else collector.run(regions)
     name = f"bedrock-report_{report['account_id']}_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
     directory = Path(args.output_dir).expanduser().resolve()/name
     directory.mkdir(parents=True, exist_ok=False)
@@ -861,7 +1121,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
  </section>
  <section class="section" id="quotas">
   <div class="panel"><div class="panel-head"><div><h2>Current quotas</h2><p>Applied values and AWS defaults are kept separate.</p></div></div>
-   <div class="filters"><input id="quota-search" placeholder="Search by model, name, or quota code…" aria-label="Search quotas"><select id="quota-kind" aria-label="Quota type"><option value="">All types</option><option value="tokens" selected>Tokens per minute</option><option value="requests">Requests per minute</option><option value="batch">Batch inference</option><option value="provisioned">Provisioned Throughput</option></select><select id="quota-adjustable" aria-label="Adjustable quotas"><option value="">All quotas</option><option value="yes">Adjustable</option><option value="no">Not adjustable</option></select></div>
+   <div class="filters"><input id="quota-search" placeholder="Search by model, name, or quota code…" aria-label="Search quotas"><select id="quota-kind" aria-label="Quota type"><option value="" selected>All types</option><option value="tokens">Tokens per minute</option><option value="daily">Daily token quotas</option><option value="requests">Requests per minute</option><option value="batch">Batch inference</option><option value="provisioned">Provisioned Throughput</option></select><select id="quota-adjustable" aria-label="Adjustable quotas"><option value="">All quotas</option><option value="yes">Adjustable</option><option value="no">Not adjustable</option></select></div>
    <div class="note info">A quota defines a limit, not guaranteed available capacity. A percentage appears only when the quota, metric, and units have a confirmed mapping.</div>
    <div class="table-wrap" id="quota-table"></div><div class="pagebar" id="quota-page"></div>
   </div>
@@ -899,6 +1159,7 @@ const state={tab:"overview",region:D.regions[0],mode:"tokens",resource:"",pages:
 const scoped=rows=>rows.filter(r=>r.region===state.region);
 const sumMetric=(g,name)=>g?.metrics.find(m=>m.metric.MetricName===name&&m.stat==="Sum");
 const total=(g,name)=>sumMetric(g,name)?.summary.total??null;
+const totalCell=(g,name)=>fmt(total(g,name))+(sumMetric(g,name)&&!["ok","no_data"].includes(sumMetric(g,name).status)?"<small>Incomplete query</small>":"");
 let groups=[],chartData=null;
 
 function pagination(name,rows,draw,container,pager,size=15){
@@ -910,13 +1171,13 @@ function pagination(name,rows,draw,container,pager,size=15){
 }
 function buildGroups(){
  const map=new Map();
- for(const m of scoped(D.metrics).filter(m=>m.points.length&&m.stat==="Sum"&&["AWS/Bedrock","AWS/BedrockMantle"].includes(m.metric.Namespace))){
+ for(const m of scoped(D.metrics).filter(m=>m.stat==="Sum"&&["AWS/Bedrock","AWS/BedrockMantle"].includes(m.metric.Namespace))){
   const dims=m.metric.Dimensions,key=m.region+"|"+m.metric.Namespace+"|"+JSON.stringify(dims);
   if(!map.has(key)){const identifier=dims.find(d=>d.Name==="ModelId"||d.Name==="Model")?.Value||"Account aggregate";
    map.set(key,{key,id:identifier,namespace:m.metric.Namespace,dims,metrics:[],extra:dims.filter(d=>d.Name!=="ModelId"&&d.Name!=="Model").map(d=>d.Name+"="+d.Value).join(", ")});
   }map.get(key).metrics.push(m);
  }
- groups=[...map.values()].sort((a,b)=>((total(b,"Invocations")??total(b,"Inferences")??0)-(total(a,"Invocations")??total(a,"Inferences")??0))||a.id.localeCompare(b.id));
+ groups=[...map.values()].filter(g=>g.metrics.some(m=>m.points.length)).sort((a,b)=>((total(b,"Invocations")??total(b,"Inferences")??0)-(total(a,"Invocations")??total(a,"Inferences")??0))||a.id.localeCompare(b.id));
  if(!groups.some(g=>g.key===state.resource))state.resource=groups[0]?.key||"";
  $("resource").innerHTML=groups.length?groups.map(g=>`<option value="${h(g.key)}">${h(g.id)}${g.extra?" · "+h(g.extra):""} · ${g.namespace==="AWS/BedrockMantle"?"mantle":"runtime"}</option>`).join(""):'<option>No series returned datapoints</option>';
  $("resource").value=state.resource;
@@ -931,12 +1192,16 @@ function renderOverview(){
  ["Observed identifiers",new Set(groups.filter(g=>g.dims.some(d=>d.Name==="ModelId"||d.Name==="Model")).map(g=>g.id)).size,"Models or profiles; future access is not implied"],
  ];
  $("cards").innerHTML=cards.map(([label,value,sub])=>`<div class="card"><label>${h(label)}</label><strong>${fmt(value)}</strong><small>${h(sub)}</small></div>`).join("");
- const issues=scoped(D.collection_issues);
- const unavailable=metrics.filter(m=>["partial","error","not_queried"].includes(m.status)).length;
- $("run-notice").innerHTML=D.usage_skipped?'<div class="note">This run did not retrieve usage datapoints. Run without --skip-usage or --plan to include history.</div>':issues.length||unavailable?`<div class="note">${fmt(issues.length)} issues recorded and ${fmt(unavailable)} series with incomplete queries. See “Collection quality” for coverage details.</div>`:"";
- const renderRows=items=>table(["Identifier","Endpoint","Requests","Input tokens","Output tokens","Throttles"],items.map(g=>{
+ const issues=D.collection_issues.filter(i=>i.region===state.region||i.region==="all"),coverage=D.diagnostic_coverage?.find(c=>c.region===state.region);
+ const unavailable=metrics.filter(m=>["partial","error","not_queried"].includes(m.status)).length+(coverage?.deferred_series||0);
+ let notices=D.usage_skipped?'<div class="note">This run did not retrieve usage datapoints. Run without --skip-usage or --plan to include history.</div>':issues.length||unavailable?`<div class="note"><strong>Quota diagnosis is incomplete.</strong> ${fmt(issues.length)} collection issues and ${fmt(unavailable)} incomplete or deferred series. Local collection limits are not inference failures. Resume the saved report to complete history.</div>`:"";
+ if(coverage&&!D.usage_skipped)notices+=`<div class="note info">Runtime throttling queries completed: ${fmt(coverage.runtime_throttle_queries_complete)} / ${fmt(coverage.runtime_throttle_series)}. Missing datapoints do not establish zero throttling.${coverage.mantle_requires_application_errors?" Mantle HTTP 429 responses require application logs; InferenceClientErrors excludes requests rejected before processing.":""}</div>`;
+ const daily=quotas.find(q=>q.quota_code==="L-E3F10727"&&q.name==="Cross-Model Max Tokens Per Day");
+ if(daily)notices+=`<div class="note info"><strong>Daily cross-model quota: ${fmt(daily.applied_value)}.</strong> AWS default: ${fmt(daily.default_value)}. Utilization is unavailable: this quota uses pricing-based accounting, not a raw sum of token metrics.</div>`;
+ $("run-notice").innerHTML=notices;
+ const renderRows=items=>table(["Identifier","Endpoint","Accepted / completed requests","Input tokens","Output tokens","Throttles","Client errors","Server errors"],items.map(g=>{
   const mantle=g.namespace==="AWS/BedrockMantle";
-  return `<tr><td><strong>${h(g.id)}</strong><small>${h(g.extra||(g.dims.length?"Model dimension":"Aggregate series, without dimensions"))}</small></td><td>${badge(mantle?"mantle":"runtime")}</td><td>${fmt(total(g,mantle?"Inferences":"Invocations"))}</td><td>${fmt(total(g,mantle?"TotalInputTokens":"InputTokenCount"))}</td><td>${fmt(total(g,mantle?"TotalOutputTokens":"OutputTokenCount"))}</td><td>${mantle?"Not published":fmt(total(g,"InvocationThrottles"))}</td></tr>`;
+  return `<tr><td><strong>${h(g.id)}</strong><small>${h(g.extra||(g.dims.length?"Model dimension":"Aggregate series, without dimensions"))}</small></td><td>${badge(mantle?"mantle":"runtime")}</td><td>${totalCell(g,mantle?"Inferences":"Invocations")}</td><td>${totalCell(g,mantle?"TotalInputTokens":"InputTokenCount")}</td><td>${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td><td>${mantle?"Application logs required":totalCell(g,"InvocationThrottles")}</td><td>${totalCell(g,mantle?"InferenceClientErrors":"InvocationClientErrors")}</td><td>${mantle?"Not collected":totalCell(g,"InvocationServerErrors")}</td></tr>`;
  }));
  pagination("usage",groups,renderRows,"usage-table","usage-page");
  renderChart();
@@ -947,12 +1212,12 @@ function renderChart(){
   [mantle?"TotalInputTokens":"InputTokenCount","Input","#007e80"],
   [mantle?"TotalOutputTokens":"OutputTokenCount","Output","#597bea"],
   ...(mantle?[]:[["EstimatedTPMQuotaUsage","Estimated TPM","#c98536"]]),
- ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Successful requests","#007e80"]]:[["InvocationThrottles","Throttles","#c98536"]];
+ ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Accepted requests","#007e80"]]:[["InvocationThrottles","Throttles","#c98536"]];
  const series=definitions.map(([name,label,color])=>({name,label,color,metric:sumMetric(g,name)})).filter(s=>s.metric?.points.length);
  $("chart-unit").textContent=state.mode==="tokens"?"tokens / min":state.mode==="requests"?"requests / min":"throttles / min";
  $("legend").innerHTML=definitions.map(([name,label,color])=>`<span><i class="dot" data-color="${h(color)}"></i>${h(label)}${!sumMetric(g,name)?.points.length?" · no data":""}</span>`).join("");
  const inv=total(g,mantle?"Inferences":"Invocations"),input=total(g,mantle?"TotalInputTokens":"InputTokenCount"),output=total(g,mantle?"TotalOutputTokens":"OutputTokenCount");
- const stats=[[mantle?"Completed inferences":"Successful requests",inv,"Total of returned datapoints"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Metric not published in this namespace":"Includes the effects of client retries"]];
+ const stats=[[mantle?"Completed inferences":"Accepted requests",inv,mantle?"Total of returned datapoints":"Includes requests that later fail"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Track HTTP 429 in application logs":"Includes the effects of client retries"]];
  $("resource-stats").innerHTML=stats.map(([label,value,sub])=>`<div><label>${h(label)}</label><strong>${fmt(value)}</strong><small>${h(sub)}</small></div>`).join("");
  const q=scoped(D.quotas).find(q=>q.comparison?.metric_id&&g?.metrics.some(m=>m.id===q.comparison.metric_id));
  $("capacity-comparison").innerHTML=q?`<div class="note info"><strong>Mapped quota: ${fmt(q.applied_value)} tokens/min.</strong> Observed peak for this series: ${fmt(q.comparison.peak_per_minute)} tokens/min, equivalent to <strong>${fmt(q.comparison.peak_percent)}%</strong> of the current quota.<br><span>${h(q.comparison.reason)}</span><br><code>${h(q.quota_code)}</code> · ${h(q.name)}</div>`:"";
@@ -970,7 +1235,7 @@ function renderChart(){
  for(let si=0;si<series.length;si++){const s=series[si];ctx.fillStyle=s.color;ctx.globalAlpha=.82;for(let i=0;i<bins;i++){if(s.values[i]===null)continue;const x=L+i*width+si*width/series.length+.5,height=Math.max(1,s.values[i]/ymax*ph);ctx.fillRect(x,T+ph-height,Math.max(.8,width/series.length-1),height)}}ctx.globalAlpha=1;
  ctx.fillStyle="#718890";for(let i=0;i<=4;i++){ctx.textAlign=i===0?"left":i===4?"right":"center";ctx.fillText(day(start+(end-start)*i/4),L+pw*i/4,ht-10);}
  const resolution=D.period_seconds===60?"1-minute peaks":`maximum per-minute averages within ${D.period_seconds/60}-minute intervals`;
- $("chart-method").textContent=`Displayed in ${bins} buckets: ${resolution}. Gaps remain missing; no interpolation is applied. Full data is available in the CSV.`;
+ $("chart-method").textContent=`Displayed in ${bins} buckets: ${resolution}. ${series.some(s=>s.metric.status!=="ok")?"Incomplete query: these totals and peaks cover only returned data. ":""}Gaps remain missing; no interpolation is applied. Returned data is available in the CSV.`;
  chartData={series,start,step,bins,L,T,pw,ph,width,w};
  canvas.setAttribute("aria-label",`${state.mode}, ${g?.id||""}, from ${day(start)} to ${day(end)}. Observed maximum: ${fmt(max)} per minute.`);
 }
@@ -978,7 +1243,7 @@ function renderQuotas(){
  const search=$("quota-search").value.toLowerCase(),kind=$("quota-kind").value,adjust=$("quota-adjustable").value;
  const rows=scoped(D.quotas).filter(q=>{
   const n=q.name.toLowerCase();return(!search||(n+" "+q.quota_code.toLowerCase()).includes(search))&&(!adjust||(q.adjustable===(adjust==="yes")))&&
-  (!kind||(kind==="tokens"&&/tokens.*per minute/.test(n))||(kind==="requests"&&/requests.*per minute/.test(n))||(kind==="batch"&&n.includes("batch"))||(kind==="provisioned"&&/provisioned|model units/.test(n)));
+  (!kind||(kind==="tokens"&&/tokens.*per minute/.test(n))||(kind==="daily"&&/tokens.*per day/.test(n))||(kind==="requests"&&/requests.*per minute/.test(n))||(kind==="batch"&&n.includes("batch"))||(kind==="provisioned"&&/provisioned|model units/.test(n)));
  }).sort((a,b)=>a.name.localeCompare(b.name));
  const draw=items=>table(["Quota","Applied","AWS default","Scope","Adjustable","Peak / current quota"],items.map(q=>`<tr>
  <td><strong>${h(q.name)}</strong><small>${h(q.quota_code)} · unit ${h(q.unit)}</small><details><summary>Source and interpretation</summary><p>${h(q.description)}<br>${h(q.source)} · ${h(when(q.collected_at))}<br>${h(q.comparison?.reason)}${q.context?.ContextId?"<br>Context: "+h(q.context.ContextId):""}</p></details></td>
@@ -1004,7 +1269,9 @@ function renderProfiles(){
 function renderQuality(){
  const metrics=scoped(D.metrics),counts={};for(const m of metrics)counts[m.status]=(counts[m.status]||0)+1;
  $("quality-summary").innerHTML=`<div class="cards">${[["With data",counts.ok||0],["No datapoints",counts.no_data||0],["Partial / error",(counts.partial||0)+(counts.error||0)],["Not queried",counts.not_queried||0]].map(([label,value])=>`<div class="card"><label>${h(label)}</label><strong>${fmt(value)}</strong></div>`).join("")}</div><p class="muted text-sm">${fmt(metrics.reduce((n,m)=>n+m.points.length,0))} datapoints returned in this Region. “No datapoints” does not mean zero usage.</p>`;
- const rows=scoped(D.collection_issues);
+ const rows=D.collection_issues.filter(i=>i.region===state.region||i.region==="all");
+ const budget=D.collection_settings;
+ if(budget)$("quality-summary").innerHTML+=`<p>Latest attempt: ${fmt(budget.metric_requests_used)} / ${fmt(budget.max_metric_requests)} metric requests; ${fmt(budget.datapoints_received)} / ${fmt(budget.max_datapoints)} datapoints; ${fmt(budget.selected_series)} / ${fmt(budget.max_metrics)} selected series. Deferred identities: ${fmt(scoped(D.deferred_metrics||[]).length)} in this Region. Completed time windows are retained for resume.</p>`;
  pagination("quality",rows,items=>table(["Operation","Status","Resource / detail"],items.map(i=>`<tr><td><code>${h(i.operation)}</code></td><td>${badge(i.status,"warn")}</td><td>${h(i.message)}<small>${h(i.resource)}</small></td></tr>`)),"quality-table","quality-page",15);
  $("limitations").innerHTML=D.limitations.map(x=>`<li>${h(x)}</li>`).join("");
  $("calls-table").innerHTML=table(["Operation","Calls"],Object.entries(D.api_calls||{}).map(([op,n])=>`<tr><td><code>${h(op)}</code></td><td>${fmt(n)}</td></tr>`));
