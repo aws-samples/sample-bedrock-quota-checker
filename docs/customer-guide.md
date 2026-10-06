@@ -111,6 +111,8 @@ The HTML report works offline, without credentials, external chart libraries, or
 | `usage_summary.csv` | Usage totals, interval statistics, and supported quota comparisons |
 | `usage_timeseries.csv` | Timestamped metric data with dimensions and resolution |
 | `collection_issues.csv` | Missing permissions, unavailable data, and other collection problems |
+| `run_log.csv` | Execution history: one row per AWS call and per collection decision, with duration, status, and budget consumed |
+| `run_log.txt` | The same run as a timestamped console transcript |
 
 The default output location is relative to the folder where you run the command; it is not necessarily your CloudShell home directory.
 

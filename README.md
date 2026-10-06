@@ -160,8 +160,30 @@ reports/
     usage_summary.csv
     usage_timeseries.csv
     collection_issues.csv
+    run_log.csv
+    run_log.txt
   bedrock-report_<account-id>_<UTC-timestamp>.zip
 ```
+
+### Execution history
+
+Every run writes its own history next to the data, so a report always explains how it was produced.
+
+- **`run_log.csv`** — one row per AWS call and per collection decision: `attempt`, `seq`, `timestamp`, `level`, `phase`, `region`, `operation`, `duration_ms`, `status`, `detail`, and, for history queries, `batch_size`, `window_start`, `window_end`, `pages`, `points`, `requests_used`, `datapoints_used`. It always contains every event, at every level.
+- **`run_log.txt`** — the console transcript with timestamps, from `--log-level` upwards (default `INFO`), ending in a per-level count.
+
+Both files are also embedded in `report.json` under `run_log`, so `--render` regenerates them from a saved report, and the HTML **Run log** tab shows the same timeline with level, phase and text filters.
+
+`--log-level DEBUG` adds the individual successful calls to the console and the transcript; they are in the CSV either way. A `--resume` run appends to the saved history under the next `attempt` number, so one report carries every attempt that built it. If a run fails or is interrupted before producing a report, the collector still writes `run_log.csv` and `run_log.txt` to a `bedrock-run-log_<UTC-timestamp>/` directory and prints the path after `RUN LOG:`.
+
+Batch summaries are the fastest way to diagnose incomplete usage data. A line such as:
+
+```text
+WARN [us-east-1] 50 series [InvocationThrottlesx25, ...] over 2026-10-05T00:00Z..2026-10-06T00:00Z:
+     0 points in 1 page(s); statuses {'MissingResult': 25, 'Complete': 25}; failure=service_message
+```
+
+names the window, the batch, how many query IDs CloudWatch never returned (`MissingResult`), and the budget consumed at that moment.
 
 ### Download from CloudShell
 
@@ -259,7 +281,7 @@ This regenerates HTML, CSV, and ZIP outputs from the saved snapshot. It refreshe
 python3 bedrock_access_report.py --help
 ```
 
-Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--region-workers` for parallel discovery, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
+Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--region-workers` for parallel discovery, `--log-level` for console and transcript verbosity, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
 
 ## How to interpret the results
 

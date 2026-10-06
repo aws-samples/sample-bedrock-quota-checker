@@ -11,13 +11,15 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import zipfile
 import zlib
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 UTC = timezone.utc
 # Narrow mappings verified against quota definitions and system profile model IDs.
 # Names are guards against changed quota semantics, not fuzzy matching rules.
@@ -86,6 +88,8 @@ RUNTIME_METRICS = (
 )
 MANTLE_METRICS = ("Inferences", "TotalInputTokens", "TotalOutputTokens", "InferenceClientErrors")
 DIAGNOSTIC_METRICS = ("InvocationThrottles", "InvocationClientErrors", "InvocationServerErrors", "InferenceClientErrors")
+# Labels for the priority groups reported in the run log; see metric_priority().
+PRIORITY_LABELS = {0: "diagnostics", 1: "discovered usage", 2: "known-id probes", 3: "administrative usage"}
 BATCH_SIZE = 50
 CHUNK_SECONDS = 86400
 ALLOWED_OPERATIONS = {
@@ -190,6 +194,89 @@ def complete_window(item, start, end):
     item["completed_windows"] = merged
 
 
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+# Column order for run_log.csv. Scalar columns only, so the file stays greppable
+# and loads into a spreadsheet without JSON parsing.
+LOG_FIELDS = (
+    "attempt", "seq", "timestamp", "level", "phase", "region", "operation",
+    "duration_ms", "status", "detail", "batch_size", "window_start", "window_end",
+    "pages", "points", "requests_used", "datapoints_used",
+)
+
+
+class RunLog:
+    """Thread-safe execution log exported next to the report.
+
+    Every AWS call and every collection decision becomes one structured event.
+    `run_log.csv` keeps the complete audit trail at all levels; `run_log.txt`
+    keeps the readable narrative from `level` upwards. A resumed run appends to
+    the saved history under a new attempt number, so one report carries the
+    whole execution history that produced it.
+    """
+
+    def __init__(self, events=(), transcript=(), attempt=1, level="INFO", echo=True):
+        self.lock = threading.Lock()
+        self.events = [dict(event) for event in events]
+        self.lines = list(transcript)
+        self.attempt = attempt
+        self.threshold = LOG_LEVELS.get(level, LOG_LEVELS["INFO"])
+        self.echo = echo
+        self.counts = Counter(event.get("level", "INFO") for event in self.events)
+        self.seq = max((event.get("seq", 0) for event in self.events), default=0)
+
+    @classmethod
+    def restore(cls, saved, **options):
+        """Continue the log of a saved report under the next attempt number."""
+        previous = (saved or {}).get("run_log") or {}
+        return cls(
+            events=previous.get("events", ()), transcript=previous.get("transcript", ()),
+            attempt=previous.get("attempt", 1) + 1, **options,
+        )
+
+    def add(self, level, phase, operation, region="", status="", detail="", **fields):
+        """Record one event and, from the transcript level upwards, print it."""
+        stamp = iso(datetime.now(UTC))
+        show = LOG_LEVELS.get(level, 20) >= self.threshold and bool(detail)
+        prefix = f"[{region}] " if region else ""
+        tag = "" if level == "INFO" else f"{level} "
+        # Hold the lock across the write so the transcript, the event list and
+        # stdout keep one consistent order while Regions are collected in parallel.
+        with self.lock:
+            self.seq += 1
+            event = {
+                "attempt": self.attempt, "seq": self.seq, "timestamp": stamp, "level": level,
+                "phase": phase, "region": region, "operation": operation,
+                "status": status, "detail": detail,
+            }
+            event.update({k: v for k, v in fields.items() if v is not None})
+            self.events.append(event)
+            self.counts[level] += 1
+            if show:
+                self.lines.append(f"{stamp} {level:<5} {prefix}{detail}")
+                if self.echo:
+                    print(f"{prefix}{tag}{detail}", flush=True)
+        return event
+
+    def snapshot(self):
+        return {
+            "attempt": self.attempt, "levels": dict(self.counts),
+            "events": self.events, "transcript": self.lines,
+        }
+
+
+def log_text(snapshot):
+    """Render the transcript, plus a counts footer, as the exported run_log.txt."""
+    snapshot = snapshot or {}
+    lines = list(snapshot.get("transcript", []))
+    counts = snapshot.get("levels", {})
+    if counts:
+        # The counts cover every attempt recorded in the snapshot, not just the last.
+        summary = ", ".join(f"{level}={counts[level]}" for level in LOG_LEVELS if counts.get(level))
+        attempts = snapshot.get("attempt", 1)
+        lines.append(f"-- totals over {attempts} attempt(s): {summary}")
+    return "".join(f"{line}\n" for line in lines)
+
+
 def window(args, now=None):
     now = now or datetime.now(UTC)
 
@@ -249,6 +336,9 @@ class Collector:
         self.clients = {}
         self.lock = threading.Lock()
         self.calls = Counter()
+        self.log = RunLog(level=getattr(args, "log_level", "INFO"))
+        # Regions are collected in parallel; the active phase is per thread.
+        self.local = threading.local()
         self.report = {
             "schema_version": "1.0", "collector_version": VERSION,
             "mapping_rules_version": TPM_RULES_VERSION,
@@ -263,6 +353,20 @@ class Collector:
         self.metric_calls = 0
         self.returned_points = 0
         self.selected_count = 0
+
+    @property
+    def phase(self):
+        return getattr(self.local, "phase", "run")
+
+    @contextmanager
+    def in_phase(self, phase):
+        """Label every event raised by this thread until the block exits."""
+        previous = self.phase
+        self.local.phase = phase
+        try:
+            yield
+        finally:
+            self.local.phase = previous
 
     def client(self, service, region):
         key = service, region
@@ -330,27 +434,42 @@ class Collector:
         if operation not in ALLOWED_OPERATIONS.get(service, set()):
             raise ValueError(f"Operation is outside the read-only allowlist: {service}.{operation}")
         client = self.client(service, region)
+        label = f"{service}.{operation}"
         if not hasattr(client, operation):
             self.issue(region, operation, "not_supported", "Update boto3: this operation is missing from the installed SDK.")
+            self.log.add("ERROR", self.phase, label, region, "not_supported",
+                         "Operation missing from the installed boto3 SDK.")
             return None
         with self.lock:
-            self.calls[f"{service}.{operation}"] += 1
+            self.calls[label] += 1
+        started = time.perf_counter()
         try:
-            return getattr(client, operation)(**kwargs)
+            response = getattr(client, operation)(**kwargs)
         except Exception as exc:
+            elapsed = round((time.perf_counter()-started)*1000, 1)
             response = getattr(exc, "response", {})
             error = response.get("Error", {})
             code = error.get("Code", type(exc).__name__)
             status = "access_denied" if any(x in code.lower() for x in ("accessdenied", "unauthorized")) else "error"
             if code in ("UnknownServiceError", "UnknownEndpointError"):
                 status = "not_supported"
-            self.issue(region, operation, status, f"{code}: {error.get('Message', str(exc))}", kwargs.get("modelId", ""))
+            message = f"{code}: {error.get('Message', str(exc))}"
+            self.issue(region, operation, status, message, kwargs.get("modelId", ""))
+            # One event per AWS call, so the timeline keeps the latency of
+            # failures as well as the error code that stopped the collection.
+            self.log.add("WARN", self.phase, label, region, status,
+                         f"{message} {kwargs.get('modelId', '')}".strip(), duration_ms=elapsed)
             return None
+        self.log.add("DEBUG", self.phase, label, region, "ok",
+                     str(kwargs.get("modelId", "")), duration_ms=round((time.perf_counter()-started)*1000, 1))
+        return response
 
     def listing(self, service, region, operation, key, token_key="nextToken", **kwargs):  # nosec B107 - Pagination field name, not a credential.
         rows, visited, status = [], set(), "ok"
+        started, pages = time.perf_counter(), 0
         for _ in range(1000):
             response = self.call(service, region, operation, **kwargs)
+            pages += 1
             if response is None:
                 status = "partial" if rows else "error"
                 break
@@ -360,18 +479,26 @@ class Collector:
                 break
             if token in visited:
                 self.issue(region, operation, "partial", "Repeated pagination token; collection stopped.")
+                self.log.add("WARN", self.phase, f"{service}.{operation}", region, "partial",
+                             "Repeated pagination token; collection stopped.", pages=pages)
                 status = "partial"
                 break
             visited.add(token)
             kwargs[token_key] = token
         else:
             self.issue(region, operation, "partial", "Page limit reached.")
+            self.log.add("WARN", self.phase, f"{service}.{operation}", region, "partial",
+                         "Page limit reached after 1000 pages.", pages=pages)
             status = "partial"
         self.report["collections"].append({"region": region, "operation": operation, "status": status, "rows": len(rows)})
+        self.log.add("DEBUG" if status == "ok" else "WARN", self.phase, f"{service}.{operation}",
+                     region, status, f"{len(rows)} rows over {pages} page(s).",
+                     duration_ms=round((time.perf_counter()-started)*1000, 1), pages=pages, points=len(rows))
         return rows
 
     def inventory(self, region):
-        print(f"[{region}] Collecting the catalog, profiles, and provisioned capacity...", flush=True)
+        self.log.add("INFO", "inventory", "inventory", region, "started",
+                     "Collecting the catalog, profiles, and provisioned capacity...")
         models = self.listing("bedrock", region, "list_foundation_models", "modelSummaries")
         for model in models:
             model["region"] = region
@@ -385,7 +512,8 @@ class Collector:
         for resource in provisioned:
             resource["region"] = region
         self.report["provisioned_throughput"].extend(provisioned)
-        print(f"[{region}] {len(models)} models, {len(profiles)} profiles, {len(provisioned)} provisioned resources.", flush=True)
+        self.log.add("INFO", "inventory", "inventory", region, "ok",
+                     f"{len(models)} models, {len(profiles)} profiles, {len(provisioned)} provisioned resources.")
         # Create the shared client before worker threads; boto3 clients support concurrent calls.
         self.client("bedrock", region)
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -398,21 +526,27 @@ class Collector:
                 availability = future.result()
                 model["availability"] = serializable(availability) if availability is not None else None
                 if i % 30 == 0 or i == len(models):
-                    print(f"[{region}] Availability checked: {i}/{len(models)}.", flush=True)
+                    self.log.add("INFO", "inventory", "get_foundation_model_availability", region,
+                                 "progress", f"Availability checked: {i}/{len(models)}.", points=i)
 
     def quotas(self, region):
-        print(f"[{region}] Collecting applied quotas and AWS defaults, with pagination...", flush=True)
+        self.log.add("INFO", "quotas", "quotas", region, "started",
+                     "Collecting applied quotas and AWS defaults, with pagination...")
         kwargs = {"ServiceCode": "bedrock", "MaxResults": 100}
         model = self.client("service-quotas", region).meta.service_model.operation_model("ListServiceQuotas")
         if "QuotaAppliedAtLevel" in model.input_shape.members:
             kwargs["QuotaAppliedAtLevel"] = "ALL"
         else:
             self.issue(region, "list_service_quotas", "partial", "This SDK supports only ACCOUNT-level queries; update it to query ALL levels.")
+            self.log.add("WARN", "quotas", "list_service_quotas", region, "partial",
+                         "This SDK supports only ACCOUNT-level queries; update it to query ALL levels.")
         applied = self.listing("service-quotas", region, "list_service_quotas", "Quotas", "NextToken", **kwargs)
         defaults = self.listing("service-quotas", region, "list_aws_default_service_quotas", "Quotas", "NextToken", ServiceCode="bedrock", MaxResults=100)
         merged = merge_quotas(applied, defaults, region, iso(datetime.now(UTC)))
         self.report["quotas"].extend(merged)
-        print(f"[{region}] {len(merged)} quotas; {sum(q['applied_value'] is not None for q in merged)} with applied values.", flush=True)
+        self.log.add("INFO", "quotas", "quotas", region, "ok",
+                     f"{len(merged)} quotas; {sum(q['applied_value'] is not None for q in merged)} with applied values.",
+                     points=len(merged))
 
     def discover(self, region):
         candidates = {}
@@ -495,7 +629,20 @@ class Collector:
         }
         with self.lock:
             self.report["query_plan"].append(plan)
-        print(f"[{region}] Plan: {len(selected)} series ({discovered} discovered), {self.period}s periods; limit of {self.args.max_datapoints:,} returned datapoints.", flush=True)
+        counts = Counter(metric_priority(m) for m in selected)
+        self.log.add("INFO", "discover", "query_plan", region, "ok",
+                     f"Plan: {len(selected)} series ({discovered} discovered), {self.period}s periods; "
+                     f"priorities {dict(sorted(counts.items()))}; "
+                     f"{plan['minimum_window_requests']} GetMetricData requests minimum against a budget of "
+                     f"{self.args.max_metric_requests}.",
+                     points=len(selected), requests_used=self.metric_calls)
+        if plan["minimum_window_requests"] > self.args.max_metric_requests:
+            # The budget cannot cover this plan; say so before the run silently
+            # truncates the lowest priorities.
+            self.log.add("WARN", "discover", "query_plan", region, "insufficient_budget",
+                         f"This Region alone needs {plan['minimum_window_requests']} requests but the run budget is "
+                         f"{self.args.max_metric_requests}. Lower priorities will be deferred; raise "
+                         f"--max-metric-requests or narrow --regions.")
         return selected
 
     def expand_observed(self, region):
@@ -548,6 +695,11 @@ class Collector:
             item.pop("status_reason", None)
             groups[(metric_priority(item), item["region"])].append(item)
         for priority in sorted({key[0] for key in groups}):
+            pending_series = sum(len(groups[key]) for key in groups if key[0] == priority)
+            self.log.add("INFO", "history", "priority_group", "", "started",
+                         f"Priority {priority} ({PRIORITY_LABELS.get(priority, 'other')}): "
+                         f"{pending_series} series, newest daily window first.",
+                         points=pending_series, requests_used=self.metric_calls)
             end = self.end
             while end > self.start:
                 start = max(self.start, end-timedelta(seconds=CHUNK_SECONDS))
@@ -579,6 +731,13 @@ class Collector:
         self.issue("all", "get_metric_data", "partial",
                    f"Local {reason}: {self.metric_calls}/{self.args.max_metric_requests} requests, "
                    f"{self.returned_points}/{self.args.max_datapoints} datapoints. Resume the saved report.")
+        stopped = Counter(m["metric"]["MetricName"] for m in metrics if m.get("status_reason") == reason)
+        self.log.add("ERROR", "history", "budget_stop", "", reason,
+                     f"Collection stopped on the local {reason} with "
+                     f"{sum(stopped.values())} series incomplete: "
+                     f"{', '.join(f'{name}x{count}' for name, count in stopped.most_common(8)) or 'none'}. "
+                     f"Resume the saved report to finish them.",
+                     requests_used=self.metric_calls, datapoints_used=self.returned_points)
 
     def fetch_window(self, region, batch, start, end):
         points = {m["id"]: dict(m["points"]) for m in batch}
@@ -594,17 +753,26 @@ class Collector:
             } for m in batch],
         }
         seen_tokens, failure, attempted = set(), None, False
+        pages, started = 0, time.perf_counter()
+        names = Counter(m["metric"]["MetricName"] for m in batch)
+        label = ", ".join(f"{name}x{count}" for name, count in names.most_common(4))
         while True:
             if not self.reserve_metric_request():
                 failure = self.budget_reason()
                 break
             attempted = True
             response = self.call("cloudwatch", region, "get_metric_data", **query)
+            pages += 1
             if response is None:
                 failure = "api_error"
                 break
             for message in response.get("Messages", []):
                 self.issue(region, "get_metric_data", "partial", message.get("Value", message))
+                # Request-scoped message: record which batch it lands on, because
+                # it suppresses window completion for every series in the batch.
+                self.log.add("WARN", "history", "get_metric_data", region, "service_message",
+                             f"{message.get('Code', 'Message')}: {message.get('Value', message)}",
+                             batch_size=len(batch), window_start=iso(start), window_end=iso(end), pages=pages)
                 failure = "service_message"
             new_points = 0
             for result in response.get("MetricDataResults", []):
@@ -627,9 +795,28 @@ class Collector:
             if token in seen_tokens:
                 failure = "repeated_pagination_token"
                 self.issue(region, "get_metric_data", "partial", "Repeated pagination token.")
+                self.log.add("WARN", "history", "get_metric_data", region, failure,
+                             "Repeated pagination token; stopped paging this batch.",
+                             batch_size=len(batch), window_start=iso(start), window_end=iso(end), pages=pages)
                 break
             seen_tokens.add(token)
             query["NextToken"] = token
+        # One summary event per batch/window. `MissingResult` counts the query IDs
+        # CloudWatch never returned, which is how diagnostic series silently
+        # disappear when a batch overflows MaxDatapoints.
+        codes = Counter(states.get(m["id"], "MissingResult") for m in batch)
+        collected = sum(len(points[m["id"]]) for m in batch)
+        level = "INFO"
+        if codes.get("MissingResult") or failure:
+            level = "ERROR" if not collected else "WARN"
+        self.log.add(level, "history", "get_metric_data", region, failure or "complete",
+                     f"{len(batch)} series [{label}] over {iso(start)[:16]}Z..{iso(end)[:16]}Z: "
+                     f"{collected} points in {pages} page(s); statuses {dict(codes.most_common())}"
+                     + (f"; failure={failure}" if failure else ""),
+                     duration_ms=round((time.perf_counter()-started)*1000, 1),
+                     batch_size=len(batch), window_start=iso(start), window_end=iso(end),
+                     pages=pages, points=collected,
+                     requests_used=self.metric_calls, datapoints_used=self.returned_points)
         for item in batch:
             key = item["id"]
             item["points"] = [[t, v] for t, v in sorted(points[key].items())]
@@ -656,10 +843,13 @@ class Collector:
 
     def collect_region(self, region):
         """Discover inventory and candidates without spending the history budget."""
-        self.inventory(region)
-        self.quotas(region)
+        with self.in_phase("inventory"):
+            self.inventory(region)
+        with self.in_phase("quotas"):
+            self.quotas(region)
         if not self.args.skip_usage:
-            return self.discover(region)
+            with self.in_phase("discover"):
+                return self.discover(region)
         return []
 
     def run(self, regions):
@@ -669,8 +859,12 @@ class Collector:
         self.report["account_id"] = identity["Account"]
         self.report["partition"] = identity["Arn"].split(":")[1]
         self.report["regions"] = regions
-        print(f"Account {identity['Account']} | profile {self.args.profile or 'credential-chain'} | {', '.join(regions)}", flush=True)
-        print(f"UTC window {iso(self.start)} → {iso(self.end)} | {self.period}s", flush=True)
+        self.log.add("INFO", "start", "collection", "", "started",
+                     f"Account {identity['Account']} | profile {self.args.profile or 'credential-chain'} | {', '.join(regions)}")
+        self.log.add("INFO", "start", "collection", "", "window",
+                     f"UTC window {iso(self.start)} -> {iso(self.end)} | {self.period}s | "
+                     f"budgets: {self.args.max_metric_requests} requests, {self.args.max_datapoints:,} datapoints, "
+                     f"{self.args.max_metrics} series")
         # Collect Regions concurrently. Global budgets (--max-metrics,
         # --max-datapoints, --max-metric-requests) remain shared across all
         # Regions via atomic reservations, so total cost stays capped.
@@ -680,7 +874,8 @@ class Collector:
             for region in regions:
                 candidates.extend(self.collect_region(region))
         else:
-            print(f"Collecting {len(regions)} Regions with up to {workers} in parallel.", flush=True)
+            self.log.add("INFO", "start", "collection", "", "parallel",
+                         f"Collecting {len(regions)} Regions with up to {workers} in parallel.")
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(self.collect_region, region): region for region in regions}
                 for future in as_completed(futures):
@@ -690,7 +885,8 @@ class Collector:
                         candidates.extend(future.result())
                     except Exception as exc:
                         self.issue(region, "collect_region", "error", f"Region collection failed: {exc}")
-                        print(f"[{region}] Collection failed: {exc}", flush=True)
+                        self.log.add("ERROR", "collect_region", "collect_region", region, "error",
+                                     f"Region collection failed: {type(exc).__name__}: {exc}")
         self.collect_candidates(candidates)
         return self.finish()
 
@@ -700,19 +896,29 @@ class Collector:
         if len(selected) < len(candidates):
             self.issue("all", "query_plan", "partial",
                        f"Local series budget exhausted: {len(candidates)-len(selected)} series deferred. Resume to collect them.")
+            self.log.add("WARN", "history", "query_plan", "", "series_budget_exhausted",
+                         f"{len(candidates)-len(selected)} of {len(candidates)} series deferred by --max-metrics "
+                         f"({self.args.max_metrics}). Resume to collect them.", points=len(selected))
         if not self.args.skip_usage and not self.args.plan:
-            self.fetch_scheduled(selected)
-            # Inactive catalog probes may discover historical identifiers.
-            extra = [m for region in self.report["regions"] for m in self.expand_observed(region)]
-            if extra:
-                extra.sort(key=lambda m: (metric_priority(m), region_sort_key(m["region"]), m["id"]))
-                self.fetch_scheduled(self.reserve_metrics(extra))
+            with self.in_phase("history"):
+                self.fetch_scheduled(selected)
+                # Inactive catalog probes may discover historical identifiers.
+                extra = [m for region in self.report["regions"] for m in self.expand_observed(region)]
+                if extra:
+                    self.log.add("INFO", "history", "expand_observed", "", "ok",
+                                 f"{len(extra)} additional series discovered from observed identifiers.",
+                                 points=len(extra))
+                    extra.sort(key=lambda m: (metric_priority(m), region_sort_key(m["region"]), m["id"]))
+                    self.fetch_scheduled(self.reserve_metrics(extra))
 
     def resume(self, saved):
         """Reuse inventory, retry incomplete windows, and write a new report later."""
         if not saved.get("metrics") and not saved.get("deferred_metrics"):
             raise ValueError("The report has no saved metric identities. Start a new usage collection.")
         regions = saved["regions"]
+        # Continue the saved execution history under the next attempt number, so a
+        # resumed report still shows what the earlier attempts did.
+        self.log = RunLog.restore(saved, level=getattr(self.args, "log_level", "INFO"))
         identity = self.call("sts", regions[0], "get_caller_identity")
         if identity is None or identity["Account"] != saved["account_id"] or identity["Arn"].split(":")[1] != saved["partition"]:
             raise ValueError("Resume requires credentials for the original account and partition.")
@@ -733,6 +939,10 @@ class Collector:
         self.report["resume_collector_version"] = VERSION
         candidates = [m for m in self.report["metrics"] if m["status"] not in ("ok", "no_data")]
         candidates.extend(self.report.get("deferred_metrics", []))
+        self.log.add("INFO", "start", "resume", "", "started",
+                     f"Attempt {self.log.attempt} on account {saved['account_id']}: retrying {len(candidates)} "
+                     f"incomplete or deferred series over the saved window {saved['start']} -> {saved['end']}.",
+                     points=len(candidates))
         self.collect_candidates(candidates)
         return self.finish()
 
@@ -748,6 +958,12 @@ class Collector:
             "include_inactive_models": getattr(self.args, "include_inactive_models", False),
             "include_api_usage": getattr(self.args, "include_api_usage", False),
         }
+        statuses = Counter(m["status"] for m in self.report["metrics"])
+        self.log.add("INFO", "finish", "collection", "", "ok",
+                     f"Collection complete: {len(self.report['collection_issues'])} issues, "
+                     f"{self.report['returned_datapoints']:,} datapoints, series {dict(statuses.most_common())}.",
+                     requests_used=self.metric_calls, datapoints_used=self.returned_points)
+        self.report["run_log"] = self.log.snapshot()
         self.report = serializable(self.report)
         analyze(self.report)
         return self.report
@@ -896,6 +1112,11 @@ def export(report, directory, collect_only=False):
     ]
     for key, fields in definitions:
         atomic_text(directory/f"{key}.csv", csv_text(report[key], fields))
+    # Execution history: the same atomic-write path as the data exports, so both
+    # files land in report.zip and survive --render of a saved report.
+    run_log = report.get("run_log") or {}
+    atomic_text(directory/"run_log.csv", csv_text(run_log.get("events", []), LOG_FIELDS))
+    atomic_text(directory/"run_log.txt", log_text(run_log))
     rows = []
     for metric in report["metrics"]:
         rows.append({
@@ -972,12 +1193,24 @@ def parser():
     result.add_argument("--max-metrics", type=int, default=3000, help="Maximum selected series per attempt; deferred identities are saved for resume (default: 3000)")
     result.add_argument("--max-datapoints", type=int, default=2000000, help="Returned datapoint limit, checked between responses (default: 2000000)")
     result.add_argument("--max-metric-requests", type=int, default=200, help="Maximum GetMetricData calls per run (default: 200)")
+    result.add_argument("--log-level", choices=sorted(LOG_LEVELS, key=LOG_LEVELS.get), default="INFO",
+                        help="Console and run_log.txt verbosity; run_log.csv always keeps every event (default: INFO)")
     result.add_argument("--collect-only", action="store_true", help="Save data without rendering HTML")
     saved = result.add_mutually_exclusive_group()
     saved.add_argument("--render", metavar="REPORT_JSON", help="Regenerate exports from saved data, without AWS calls")
     saved.add_argument("--resume", metavar="REPORT_JSON", help="Retry incomplete usage windows in the original account; save a new report")
     result.add_argument("--version", action="version", version=VERSION)
     return result
+
+
+def dump_run_log(snapshot, output_dir):
+    """Write only the execution history, for a run that produced no report."""
+    directory = Path(output_dir).expanduser().resolve()/(
+        f"bedrock-run-log_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}")
+    directory.mkdir(parents=True, exist_ok=True)
+    atomic_text(directory/"run_log.csv", csv_text(snapshot.get("events", []), LOG_FIELDS))
+    atomic_text(directory/"run_log.txt", log_text(snapshot))
+    return directory/"run_log.csv"
 
 
 def main():
@@ -992,6 +1225,7 @@ def main():
         archive = export(report, path.parent)
         print(f"HTML: {path.parent/'report.html'}")
         print(f"QUOTAS CSV: {path.parent/'quotas.csv'}")
+        print(f"RUN LOG: {path.parent/'run_log.csv'} · {path.parent/'run_log.txt'}")
         print(f"JSON: {path}")
         print(f"ZIP: {archive}")
         return
@@ -1033,7 +1267,16 @@ def main():
     # Order Regions by display priority so the HTML Overview and its Region
     # selector lead with us-east-1, then North America, Europe, South America.
     regions = order_regions(regions)
-    report = collector.resume(saved_report) if saved_report else collector.run(regions)
+    try:
+        report = collector.resume(saved_report) if saved_report else collector.run(regions)
+    except BaseException as exc:
+        # An aborted or failed run still has a history worth keeping; write the
+        # log on its own before the error propagates.
+        collector.log.add("ERROR", collector.phase, "collection", "", type(exc).__name__,
+                          f"Run did not finish: {type(exc).__name__}: {exc}")
+        path = dump_run_log(collector.log.snapshot(), args.output_dir)
+        print(f"RUN LOG: {path}", file=sys.stderr)
+        raise
     name = f"bedrock-report_{report['account_id']}_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
     directory = Path(args.output_dir).expanduser().resolve()/name
     directory.mkdir(parents=True, exist_ok=False)
@@ -1041,9 +1284,13 @@ def main():
     if not args.collect_only:
         print(f"HTML: {directory/'report.html'}")
     print(f"QUOTAS CSV: {directory/'quotas.csv'}")
+    print(f"RUN LOG: {directory/'run_log.csv'} · {directory/'run_log.txt'}")
     print(f"JSON: {directory/'report.json'}")
     print(f"ZIP: {archive}")
-    print(f"Collection complete: {len(report['collection_issues'])} issues recorded; {report['returned_datapoints']:,} datapoints.")
+    levels = (report.get("run_log") or {}).get("levels", {})
+    print(f"Collection complete: {len(report['collection_issues'])} issues recorded; "
+          f"{report['returned_datapoints']:,} datapoints; "
+          f"{levels.get('ERROR', 0)} errors and {levels.get('WARN', 0)} warnings logged.")
 
 
 HTML = r"""<!doctype html>
@@ -1065,7 +1312,7 @@ nav button:hover{background:#203e47}nav button.active{background:#24515a;color:#
 main{margin-left:228px;padding:26px 40px 60px;max-width:1800px}.topline{display:flex;justify-content:space-between;gap:16px;align-items:center;border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:26px}
 .eyebrow{text-transform:uppercase;letter-spacing:1.8px;font-size:10px;font-weight:750;color:var(--muted)}.tag{display:inline-flex;align-items:center;gap:7px;border:1px solid #c9e5dc;background:#edf9f4;color:#207051;border-radius:20px;padding:5px 11px;font-size:11px;font-weight:650}.tag:before{content:"";width:6px;height:6px;background:#36a780;border-radius:100%}
 .downloads{display:flex;gap:10px;flex-wrap:wrap}.downloads a{display:inline-block;text-decoration:none;background:#fff;border:1px solid var(--border);border-radius:7px;padding:8px 13px;font-size:12px;font-weight:650}
-.text-xs{font-size:11px}.text-sm{font-size:12px}
+.text-xs{font-size:11px}.nowrap{white-space:nowrap}.text-sm{font-size:12px}
 .dot[data-color="#007e80"]{background:#007e80}.dot[data-color="#597bea"]{background:#597bea}.dot[data-color="#c98536"]{background:#c98536}
 h1{font-size:32px;line-height:1.2;letter-spacing:-1.1px;margin:9px 0 10px}h2{font-size:18px;letter-spacing:-.35px;margin:0 0 5px}h3{font-size:14px;margin:0 0 10px}p{margin:0 0 12px}.muted{color:var(--muted)}.lead{font-size:14px;color:var(--muted);max-width:900px}
 .scope{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:23px 0}.scope label{color:var(--muted);font-size:12px}.scope select{min-width:145px}
@@ -1095,6 +1342,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
   <button data-tab="models">Models & access <span id="model-nav"></span></button>
   <button data-tab="profiles">Inference profiles <span id="profile-nav"></span></button>
   <button data-tab="quality">Collection quality <span id="issue-nav"></span></button>
+  <button data-tab="runlog">Run log <span id="log-nav"></span></button>
  </nav>
  <div class="aside-foot">AWS ACCOUNT<strong id="account-side"></strong><span id="profile-side"></span><br><br>Local report · works offline<br>Credentials are not included</div>
 </aside>
@@ -1140,6 +1388,13 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
   <div class="panel"><h2>Collection coverage</h2><div id="quality-summary"></div><div class="table-wrap" id="quality-table"></div><div class="pagebar" id="quality-page"></div></div>
   <div class="panel"><h2>Interpretation limits</h2><ul class="quality-list" id="limitations"></ul></div>
   <div class="panel"><h2>Operations performed</h2><p class="muted text-sm">Logical collector calls; internal SDK retries may generate additional requests.</p><div class="table-wrap" id="calls-table"></div></div>
+ </section>
+ <section class="section" id="runlog">
+  <div class="panel"><h2>Execution history</h2><p class="muted text-sm">Every AWS call and collection decision, in order, across all attempts of this report. Also exported as <code>run_log.csv</code> and <code>run_log.txt</code>.</p>
+   <div id="log-summary"></div>
+   <div class="filters"><input id="log-search" type="search" placeholder="Filter by operation, Region, status or detail" aria-label="Filter the run log"><select id="log-level" aria-label="Minimum level"><option value="">All levels</option><option>DEBUG</option><option selected>INFO</option><option>WARN</option><option>ERROR</option></select><select id="log-phase" aria-label="Phase"><option value="">All phases</option></select></div>
+   <div class="table-wrap" id="log-table"></div><div class="pagebar" id="log-page"></div>
+  </div>
  </section>
  <div class="footer" id="footer"></div>
 </main>
@@ -1276,9 +1531,36 @@ function renderQuality(){
  $("limitations").innerHTML=D.limitations.map(x=>`<li>${h(x)}</li>`).join("");
  $("calls-table").innerHTML=table(["Operation","Calls"],Object.entries(D.api_calls||{}).map(([op,n])=>`<tr><td><code>${h(op)}</code></td><td>${fmt(n)}</td></tr>`));
 }
+const LOG_RANK={DEBUG:10,INFO:20,WARN:30,ERROR:40};
+// Log rows need second precision and no line breaks; `when` is for prose elsewhere.
+const clock=v=>new Date(v).toISOString().replace("T"," ").slice(5,19)+"Z";
+function renderRunLog(){
+ const events=(D.run_log||{}).events||[];
+ const counts=(D.run_log||{}).levels||{};
+ const attempts=new Set(events.map(e=>e.attempt||1)).size;
+ $("log-summary").innerHTML=events.length
+  ?`<div class="cards">${[["Events",events.length],["Attempts",attempts],["Warnings",counts.WARN||0],["Errors",counts.ERROR||0]].map(([label,value])=>`<div class="card"><label>${h(label)}</label><strong>${fmt(value)}</strong></div>`).join("")}</div>`
+  :'<div class="empty">This report was produced before run logging, or by --render of such a report.<strong>Collect again to capture the execution history.</strong></div>';
+ const phases=[...new Set(events.map(e=>e.phase).filter(Boolean))];
+ const chosen=$("log-phase").value;
+ $("log-phase").innerHTML='<option value="">All phases</option>'+phases.map(p=>`<option${p===chosen?" selected":""}>${h(p)}</option>`).join("");
+ const search=$("log-search").value.toLowerCase(),floor=LOG_RANK[$("log-level").value]||0,phase=$("log-phase").value;
+ const rows=events.filter(e=>(LOG_RANK[e.level]||20)>=floor&&(!phase||e.phase===phase)
+  &&(!search||[e.operation,e.region,e.status,e.detail,e.phase].join(" ").toLowerCase().includes(search)));
+ const draw=items=>table(["#","Time","Level","Phase / Region","Operation","Detail","Cost"],items.map(e=>{
+  const kind=e.level==="ERROR"?"bad":e.level==="WARN"?"warn":"";
+  const cost=[e.duration_ms!=null?`${fmt(e.duration_ms)} ms`:"",e.pages?`${fmt(e.pages)} page(s)`:"",
+   e.points!=null?`${fmt(e.points)} pts`:"",e.requests_used!=null?`req ${fmt(e.requests_used)}`:""].filter(Boolean).join(" · ");
+  return `<tr><td class="nowrap"><code>${h(e.attempt||1)}.${h(e.seq)}</code></td><td class="nowrap text-xs">${h(clock(e.timestamp))}</td><td>${badge(e.level,kind)}</td>`
+   +`<td class="nowrap">${h(e.phase)}<small>${h(e.region||"all Regions")}</small></td><td class="nowrap"><code>${h(e.operation)}</code><small>${h(e.status)}</small></td>`
+   +`<td>${h(e.detail)}</td><td class="text-xs nowrap">${h(cost)}</td></tr>`;
+ }));
+ pagination("runlog",rows,draw,"log-table","log-page",25);
+}
 function refresh(){
- buildGroups();renderOverview();renderQuotas();renderModels();renderProfiles();renderQuality();
+ buildGroups();renderOverview();renderQuotas();renderModels();renderProfiles();renderQuality();renderRunLog();
  $("quota-nav").textContent=fmt(scoped(D.quotas).length);$("model-nav").textContent=fmt(scoped(D.models).length);$("profile-nav").textContent=fmt(scoped(D.inference_profiles).length);$("issue-nav").textContent=fmt(scoped(D.collection_issues).length);
+ $("log-nav").textContent=fmt(((D.run_log||{}).events||[]).length);
 }
 $("account-side").textContent=D.account_id;$("profile-side").textContent="Profile "+D.profile;
 $("region").innerHTML=D.regions.map(r=>`<option>${h(r)}</option>`).join("");
@@ -1289,7 +1571,7 @@ $("region").onchange=()=>{state.region=$("region").value;state.pages={};refresh(
 $("resource").onchange=()=>{state.resource=$("resource").value;renderChart()};
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".section").forEach(x=>x.classList.toggle("active",x.id===state.tab));if(state.tab==="overview")renderChart();window.scrollTo({top:0,behavior:"smooth"})});
 document.querySelectorAll("#chart-tabs button").forEach(b=>b.onclick=()=>{state.mode=b.dataset.mode;document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x===b));renderChart()});
-for(const [ids,key,fn] of [[["quota-search","quota-kind","quota-adjustable"],"quota",renderQuotas],[["model-search"],"model",renderModels],[["profile-search"],"profile",renderProfiles]])for(const id of ids)$(id).addEventListener("input",()=>{state.pages[key]=0;fn()});
+for(const [ids,key,fn] of [[["quota-search","quota-kind","quota-adjustable"],"quota",renderQuotas],[["model-search"],"model",renderModels],[["profile-search"],"profile",renderProfiles],[["log-search","log-level","log-phase"],"runlog",renderRunLog]])for(const id of ids)$(id).addEventListener("input",()=>{state.pages[key]=0;fn()});
 $("chart").onmousemove=event=>{if(!chartData)return;const c=chartData,rect=$("chart").getBoundingClientRect(),x=event.clientX-rect.left,i=Math.floor((x-c.L)/c.width),tip=$("tooltip");if(i<0||i>=c.bins){tip.hidden=true;return}tip.innerHTML=`<strong>${h(when(c.start+i*c.step))}</strong><br>`+c.series.map(s=>`${h(s.label)}: ${s.values[i]===null?"no data":fmt(s.values[i])+" / min"}`).join("<br>");tip.hidden=false;tip.style.left=Math.min(Math.max(0,x+10),Math.max(0,c.w-290))+"px";tip.style.top="15px"};
 $("chart").onmouseleave=()=>{$("tooltip").hidden=true};
 let resizeTimer;window.addEventListener("resize",()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(renderChart,100)});
