@@ -1176,8 +1176,10 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--profile", help="AWS profile; uses boto3's credential chain when omitted")
     region = result.add_mutually_exclusive_group()
-    region.add_argument("--regions", nargs="+", help="AWS source Regions to query (default: configured Region)")
-    region.add_argument("--all-enabled-regions", action="store_true", help="Discover enabled Regions; requires ec2:DescribeRegions")
+    region.add_argument("--regions", nargs="+",
+                        help="Limit the collection to these Regions (default: all enabled Regions with a Bedrock endpoint)")
+    region.add_argument("--all-enabled-regions", action="store_true",
+                        help="Scan every enabled Region (the default); pass this to require ec2:DescribeRegions and fail if it is denied")
     time = result.add_mutually_exclusive_group()
     time.add_argument("--days", type=float, default=14, help="History length in days (default: 14)")
     time.add_argument("--start", help="History start in ISO 8601 format with a timezone")
@@ -1201,6 +1203,37 @@ def parser():
     saved.add_argument("--resume", metavar="REPORT_JSON", help="Retry incomplete usage windows in the original account; save a new report")
     result.add_argument("--version", action="version", version=VERSION)
     return result
+
+
+def resolve_regions(session, args, collector):
+    """Choose which Regions to collect.
+
+    Default (no flags) and explicit --all-enabled-regions both discover every
+    enabled Region that has a Bedrock endpoint, so a capacity report is
+    account-wide by default. --regions overrides with an explicit list. If
+    ec2:DescribeRegions is denied, the default falls back to the configured
+    Region (with a warning); an explicit --all-enabled-regions fails instead.
+    """
+    if args.regions:
+        return list(dict.fromkeys(args.regions))
+    # Only a seed Region is needed to place the DescribeRegions call itself.
+    seed = session.region_name or "us-east-1"
+    response = collector.call("ec2", seed, "describe_regions", AllRegions=False)
+    if response is None:
+        if args.all_enabled_regions:
+            raise RuntimeError("Could not list enabled Regions (needs ec2:DescribeRegions); pass --regions instead.")
+        if not session.region_name:
+            raise ValueError("Could not list enabled Regions and no Region is configured. "
+                             "Pass --regions, or grant ec2:DescribeRegions for the all-Regions default.")
+        collector.log.add("WARN", "start", "describe_regions", seed, "fallback",
+                          f"ec2:DescribeRegions unavailable; defaulting to the configured Region {session.region_name} only. "
+                          f"Pass --regions to choose Regions, or grant ec2:DescribeRegions to scan all.")
+        return [session.region_name]
+    supported = set(session.get_available_regions("bedrock"))
+    regions = [r["RegionName"] for r in response["Regions"] if r["RegionName"] in supported]
+    if not regions:
+        raise RuntimeError("No enabled Regions match the Bedrock endpoints known to this SDK.")
+    return regions
 
 
 def dump_run_log(snapshot, output_dir):
@@ -1252,18 +1285,8 @@ def main():
     except ImportError as exc:
         raise RuntimeError("Install boto3 in your Python environment before running the collector.") from exc
     session = boto3.Session(profile_name=args.profile)
-    regions = saved_report["regions"] if saved_report else list(dict.fromkeys(args.regions or [session.region_name]))
-    if not regions[0]:
-        raise ValueError("No Region configured. Provide --regions or configure a Region in the profile.")
     collector = Collector(session, args, start, end, period)
-    if args.all_enabled_regions:
-        response = collector.call("ec2", regions[0], "describe_regions", AllRegions=False)
-        if response is None:
-            raise RuntimeError("Could not list enabled Regions; use --regions.")
-        supported = set(session.get_available_regions("bedrock"))
-        regions = [r["RegionName"] for r in response["Regions"] if r["RegionName"] in supported]
-        if not regions:
-            raise RuntimeError("No enabled Regions match the Bedrock endpoints known to this SDK.")
+    regions = saved_report["regions"] if saved_report else resolve_regions(session, args, collector)
     # Order Regions by display priority so the HTML Overview and its Region
     # selector lead with us-east-1, then North America, Europe, South America.
     regions = order_regions(regions)

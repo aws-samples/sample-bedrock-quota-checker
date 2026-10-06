@@ -46,7 +46,7 @@ chmod ugo+x run.sh
 ./run.sh
 ```
 
-With no arguments, the script uses the configured AWS Region and defaults to `--days 14 --output-dir ./reports`. If no Region is configured, supply `--regions`. Use `--all-enabled-regions` explicitly for broader discovery; it requires `ec2:DescribeRegions`. Arguments are forwarded directly to the collector and replace the script defaults:
+With no arguments, the script scans **all enabled Regions** that have a Bedrock endpoint and defaults to `--days 14 --output-dir ./reports`. The all-Regions default needs `ec2:DescribeRegions`; if that permission is denied the collector falls back to the configured Region and logs a warning. Narrow the scope with `--regions us-east-1 [...]`, or pass `--all-enabled-regions` to require `ec2:DescribeRegions` and fail (rather than fall back) if it is unavailable. Arguments are forwarded directly to the collector and replace the script defaults:
 
 ```bash
 # Inventory and quotas only

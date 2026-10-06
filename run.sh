@@ -15,8 +15,8 @@
 # none, sensible defaults are used (see DEFAULT_ARGS below).
 #
 # Examples:
-#   ./run.sh                                        # configured Region, 14 days
-#   ./run.sh --regions us-east-1 --skip-usage         # inventory and quotas only
+#   ./run.sh                                        # all enabled Regions, 14 days
+#   ./run.sh --regions us-east-1 --skip-usage         # one Region: inventory and quotas only
 #   ./run.sh --profile customer-readonly --regions us-east-1 --days 30
 #
 # Environment overrides:
@@ -34,7 +34,8 @@ VENV="${VENV:-.venv}"
 COLLECTOR="bedrock_access_report.py"
 
 # Default collector arguments, used only when none are provided on the command line.
-# Start in the configured Region. Broad discovery is an explicit option.
+# The collector scans all enabled Regions by default (falling back to the
+# configured Region if ec2:DescribeRegions is denied); narrow it with --regions.
 DEFAULT_ARGS=(--days 14 --output-dir ./reports)
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

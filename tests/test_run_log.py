@@ -301,3 +301,62 @@ class LogExportTests(TestCase):
 if __name__ == "__main__":
     import unittest
     unittest.main()
+
+
+class RegionResolutionTests(TestCase):
+    """resolve_regions(): all-Regions by default, with graceful fallback."""
+
+    def _args(self, **over):
+        from bedrock_access_report import parser
+        a = parser().parse_args([])
+        for k, v in over.items():
+            setattr(a, k, v)
+        return a
+
+    def _session(self, region_name="us-east-1", regions=("us-east-1", "us-west-2", "eu-west-1")):
+        s = Mock()
+        s.region_name = region_name
+        s.get_available_regions.return_value = list(regions) + ["ap-south-1"]
+        return s
+
+    def _collector_with(self, describe_response):
+        c = quiet()
+        c.call = Mock(return_value=describe_response)
+        return c
+
+    def test_default_discovers_all_enabled_bedrock_regions(self):
+        from bedrock_access_report import resolve_regions
+        c = self._collector_with({"Regions": [
+            {"RegionName": "us-east-1"}, {"RegionName": "us-west-2"},
+            {"RegionName": "eu-west-1"}, {"RegionName": "cn-north-1"},  # not Bedrock-supported
+        ]})
+        regions = resolve_regions(self._session(), self._args(), c)
+        self.assertEqual(set(regions), {"us-east-1", "us-west-2", "eu-west-1"})
+        c.call.assert_called_once()
+        self.assertEqual(c.call.call_args[0][2], "describe_regions")
+
+    def test_explicit_regions_skip_discovery(self):
+        from bedrock_access_report import resolve_regions
+        c = quiet()
+        c.call = Mock(side_effect=AssertionError("describe_regions must not be called"))
+        regions = resolve_regions(self._session(), self._args(regions=["us-east-1", "us-east-1", "sa-east-1"]), c)
+        self.assertEqual(regions, ["us-east-1", "sa-east-1"])  # de-duplicated, order preserved
+
+    def test_default_falls_back_to_configured_region_when_describe_denied(self):
+        from bedrock_access_report import resolve_regions
+        c = self._collector_with(None)  # call() returns None on error
+        regions = resolve_regions(self._session(region_name="us-west-2"), self._args(), c)
+        self.assertEqual(regions, ["us-west-2"])
+        self.assertTrue([e for e in events(c.log) if e.get("status") == "fallback"])
+
+    def test_explicit_all_enabled_regions_fails_hard_when_denied(self):
+        from bedrock_access_report import resolve_regions
+        c = self._collector_with(None)
+        with self.assertRaises(RuntimeError):
+            resolve_regions(self._session(), self._args(all_enabled_regions=True), c)
+
+    def test_no_region_and_no_discovery_is_an_error(self):
+        from bedrock_access_report import resolve_regions
+        c = self._collector_with(None)
+        with self.assertRaises(ValueError):
+            resolve_regions(self._session(region_name=None), self._args(), c)
