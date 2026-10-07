@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -67,6 +68,65 @@ for _name, _model, _input, _output in (
             _model, _metric,
         )
 
+RPM_RULES_VERSION = "2026-10-07.1"
+# Requests-per-minute quotas carry no UsageMetric and no Period, so Service
+# Quotas cannot link them to a series. The quota name does carry the scope and a
+# model label, and Invocations is published per ModelId, so the link is derived
+# and then validated: a label must resolve to exactly ONE identity built from
+# live inventory. Equality is exact after normalization; a label that two
+# identities share is dropped rather than guessed, because a wrong mapping would
+# report a confident utilization figure for the wrong model.
+RPM_QUOTA_NAME = re.compile(
+    r"^(?P<scope>Global cross-region|Cross-region|On-demand) "
+    r"model inference requests per minute for (?P<model>.+)$")
+RPM_SCOPES = {"Global cross-region": "global", "Cross-region": "cross", "On-demand": "on_demand"}
+# Geography prefix of a regional system-defined inference profile, as opposed to
+# a bare model id, which is reached on demand.
+GEO_PREFIX = re.compile(r"^(us|us-gov|eu|apac|ca|sa|au|jp|kr|in|il|mx)\.")
+
+
+def normalize_label(text):
+    """Compare model labels on letters and digits only; punctuation and spacing
+    differ between quota names, profile identifiers and catalogue names."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def rpm_targets(report, region):
+    """Normalized model label -> the single ModelId dimension it can mean.
+
+    Labels come only from inventory this run collected: a system-defined
+    profile's one destination model for the cross-region scopes, and an
+    on-demand catalogue model for the on-demand scope. Nothing is inferred from
+    a substring, and an ambiguous label is omitted.
+    """
+    catalogue = {m["modelId"]: m for m in report.get("models", []) if m.get("region") == region}
+
+    def forms(model_id):
+        entry = catalogue.get(model_id) or {}
+        name, provider = entry.get("modelName"), entry.get("providerName")
+        shapes = {model_id, re.sub(r":\d+$", "", model_id), name, f"{provider} {name}" if provider and name else ""}
+        return {normalize_label(s) for s in shapes if s}
+
+    tables = {scope: defaultdict(set) for scope in RPM_SCOPES.values()}
+    for profile in report.get("inference_profiles", []):
+        if (profile.get("region") != region or profile.get("type") != "SYSTEM_DEFINED"
+                or profile.get("status") != "ACTIVE"):
+            continue
+        destinations = {m["modelArn"].split("/")[-1] for m in profile.get("models") or []}
+        if len(destinations) != 1:
+            continue
+        scope = "global" if profile["inferenceProfileId"].startswith("global.") else "cross"
+        for label in forms(next(iter(destinations))):
+            tables[scope][label].add(profile["inferenceProfileId"])
+    for model_id, entry in catalogue.items():
+        if "ON_DEMAND" not in (entry.get("inferenceTypesSupported") or []):
+            continue
+        for label in forms(model_id):
+            tables["on_demand"][label].add(model_id)
+    return {scope: {label: next(iter(ids)) for label, ids in table.items() if len(ids) == 1}
+            for scope, table in tables.items()}
+
+
 REPORT_LIMITATIONS = (
     "Quotas are a current snapshot; they do not reconstruct historical limits.",
     "Reported availability does not test the application's effective invocation permissions.",
@@ -83,6 +143,9 @@ REPORT_LIMITATIONS = (
     "Metric names and dimension sets come from ListMetrics; a namespace reported as empty published nothing in this account, which is not proof that the namespace does not exist.",
     "Gauge statistics (Average, Maximum, p99) are not summable. Totals and per-minute rates are reported only for Sum series.",
     "p99 is computed by CloudWatch over each period, so it cannot be re-aggregated across periods into a window-wide p99.",
+    "Requests-per-minute quotas carry no UsageMetric. Their link to a series is derived from the quota name's scope and model label, and is reported only when that label resolves to exactly one collected profile or on-demand model.",
+    "Invocations counts accepted requests. A request-quota percentage therefore excludes throttled requests, and a peak at the limit alongside throttling means demand exceeded it by an amount this percentage does not show.",
+    "An observed request ceiling is measured from the intervals that recorded throttling. Quotas listed beside it match that rate and scope; confirming which one applied needs the application's errors or AWS Support.",
 )
 RUNTIME_METRICS = (
     "Invocations", "InputTokenCount", "OutputTokenCount", "EstimatedTPMQuotaUsage",
@@ -1133,6 +1196,107 @@ def analyze(report):
             "p95_percent": 100*metric["summary"]["p95_per_minute"]/quota["applied_value"],
             "reason": "Observed billable tokens against the matching Mantle input/output quota in this Region. Cached input accounting and upfront reservations can differ. HTTP 429 responses require application logs; low observed usage does not rule out throttling.",
         }
+    # Requests per minute against Invocations. Unlike the token quotas there is
+    # no estimator metric in between: Invocations is the count the quota limits.
+    targets = {}
+    for quota in report["quotas"]:
+        if quota["comparison"]["status"] != "unmapped":
+            continue
+        matched = RPM_QUOTA_NAME.match(quota["name"] or "")
+        if (not matched or quota["level"] != "ACCOUNT" or quota["global"] or quota["context"]
+                or not quota["applied_value"] or quota["applied_value"] <= 0):
+            continue
+        region = quota["region"]
+        if region not in targets:
+            targets[region] = rpm_targets(report, region)
+        scope = RPM_SCOPES[matched.group("scope")]
+        model_id = targets[region][scope].get(normalize_label(matched.group("model")))
+        if not model_id:
+            quota["comparison"] = {
+                "status": "unmapped",
+                "reason": "Requests-per-minute quota whose model label does not resolve to exactly one "
+                          "collected profile or on-demand model in this Region.",
+            }
+            continue
+        metric = by_id.get(metric_id(region, {
+            "Namespace": "AWS/Bedrock", "MetricName": "Invocations",
+            "Dimensions": [{"Name": "ModelId", "Value": model_id}],
+        }))
+        if not metric or metric["stat"] != "Sum":
+            continue
+        if metric["status"] != "ok":
+            quota["comparison"] = {
+                "status": "incomplete", "model_id": model_id,
+                "reason": "The model label resolves to one identity, but the Invocations query is incomplete or has no datapoints.",
+            }
+            continue
+        peak = metric["summary"]["peak_per_minute"]
+        throttles = by_id.get(metric_id(region, {
+            "Namespace": "AWS/Bedrock", "MetricName": "InvocationThrottles",
+            "Dimensions": [{"Name": "ModelId", "Value": model_id}],
+        }))
+        quota["comparison"] = {
+            "status": "estimated", "source": "AWS/Bedrock.Invocations",
+            "rule_version": RPM_RULES_VERSION, "metric_id": metric["id"],
+            "model_id": model_id, "scope": scope,
+            "peak_per_minute": peak, "peak_percent": 100*peak/quota["applied_value"],
+            "p95_percent": 100*metric["summary"]["p95_per_minute"]/quota["applied_value"],
+            "throttles_total": (throttles or {}).get("summary", {}).get("total"),
+            "reason": "Accepted requests per minute against this quota. Invocations counts accepted requests, "
+                      "so rejected ones are not included: a peak at the limit together with throttling means "
+                      "demand exceeded it, and the excess is not visible in this percentage.",
+        }
+    # Where throttling was recorded, the accepted rate during the throttled
+    # intervals is a measurement of the ceiling that was in force, and it needs
+    # no quota mapping. Reported for every throttled model, including those whose
+    # quota label could not be resolved above.
+    report["throttle_evidence"] = []
+    for metric in report["metrics"]:
+        definition = metric.get("metric") or {}
+        dimensions = definition.get("Dimensions") or []
+        if (definition.get("Namespace") != "AWS/Bedrock" or definition.get("MetricName") != "InvocationThrottles"
+                or metric["stat"] != "Sum" or not (metric["summary"]["total"] or 0)
+                or len(dimensions) != 1 or dimensions[0]["Name"] != "ModelId"):
+            continue
+        region, model_id = metric.get("region"), dimensions[0]["Value"]
+        accepted = by_id.get(metric_id(region, {
+            "Namespace": "AWS/Bedrock", "MetricName": "Invocations", "Dimensions": dimensions,
+        }))
+        if not accepted or accepted["status"] != "ok":
+            continue
+        by_stamp = dict(accepted["points"])
+        factor = 60 / metric["period_seconds"]
+        throttled = [stamp for stamp, value in metric["points"] if value > 0]
+        rates = sorted({by_stamp.get(stamp, 0) * factor for stamp in throttled})
+        ceiling = max(rates) if rates else None
+        # A quota can only apply to this identity if its scope agrees: a regional
+        # profile is reached by Cross-region, a global one by Global cross-region,
+        # and a bare model id by On-demand. No model label is parsed here.
+        scope = ("global" if model_id.startswith("global.")
+                 else "cross" if GEO_PREFIX.match(model_id) else "on_demand")
+        candidates = []
+        for quota in report["quotas"]:
+            named = RPM_QUOTA_NAME.match(quota["name"] or "")
+            if (quota["region"] != region or not named or quota["applied_value"] != ceiling
+                    or RPM_SCOPES[named.group("scope")] != scope):
+                continue
+            candidates.append({"quota_code": quota["quota_code"], "name": quota["name"],
+                               "applied_value": quota["applied_value"]})
+        report["throttle_evidence"].append({
+            "region": region, "model_id": model_id, "scope": scope,
+            "throttles_total": metric["summary"]["total"],
+            "throttled_intervals": len(throttled),
+            "accepted_peak_per_minute": accepted["summary"]["peak_per_minute"],
+            "accepted_per_minute_while_throttled": rates,
+            "observed_ceiling_per_minute": ceiling,
+            "matching_request_quotas": candidates[:8],
+            "matching_request_quota_count": len(candidates),
+            "reason": "Accepted requests per minute in the intervals that recorded throttling. A rate that holds "
+                      "steady across those intervals is the ceiling that applied, measured rather than mapped. "
+                      "Quotas are listed only when their applied value equals that rate and their scope fits this "
+                      "identity; they are candidates to confirm, not a mapping.",
+        })
+    report["throttle_evidence"].sort(key=lambda e: -e["throttles_total"])
     report["diagnostic_coverage"] = []
     for region in report.get("regions", []):
         metrics = [m for m in report["metrics"] if m["region"] == region]
@@ -1658,6 +1822,18 @@ function renderOverview(){
  if(coverage&&!D.usage_skipped)notices+=`<div class="note info">Runtime throttling queries completed: ${fmt(coverage.runtime_throttle_queries_complete)} / ${fmt(coverage.runtime_throttle_series)}. Missing datapoints do not establish zero throttling.${coverage.mantle_requires_application_errors?" Mantle HTTP 429 responses require application logs; InferenceClientErrors excludes requests rejected before processing.":""}</div>`;
  const daily=quotas.find(q=>q.quota_code==="L-E3F10727"&&q.name==="Cross-Model Max Tokens Per Day");
  if(daily)notices+=`<div class="note info"><strong>Daily cross-model quota: ${fmt(daily.applied_value)}.</strong> AWS default: ${fmt(daily.default_value)}. Utilization is unavailable: this quota uses pricing-based accounting, not a raw sum of token metrics.</div>`;
+ // Throttling was recorded: lead with the rate that was in force when it happened.
+ for(const e of (D.throttle_evidence||[]).filter(e=>e.region===state.region)){
+  const rates=e.accepted_per_minute_while_throttled||[];
+  const steady=rates.length===1?`held steady at ${fmt(rates[0])}`:`ranged ${fmt(Math.min(...rates))} to ${fmt(Math.max(...rates))}`;
+  const list=(e.matching_request_quotas||[]).map(q=>`<code>${h(q.quota_code)}</code> ${h(q.name)}`).join("<br>");
+  notices+=`<div class="note"><strong>${fmt(e.throttles_total)} request${e.throttles_total===1?"":"s"} throttled on ${h(e.model_id)}.</strong> `
+   +`Across the ${fmt(e.throttled_intervals)} interval${e.throttled_intervals===1?"":"s"} that recorded throttling, accepted requests ${h(steady)} per minute. `
+   +`That rate is the ceiling that applied, measured rather than mapped.`
+   +(list?`<br><span>Requests-per-minute quotas in this Region whose applied value equals it, and whose scope fits this identity — candidates to confirm, not a mapping:</span><br>${list}`
+         :`<br><span>No requests-per-minute quota in this Region has an applied value equal to that rate, so the limit reached was a different one.</span>`)
+   +`</div>`;
+ }
  $("run-notice").innerHTML=notices;
  const extras=extraNames();
  const renderRows=items=>table([
@@ -1707,8 +1883,13 @@ function renderChart(){
  const inv=total(g,mantle?"Inferences":"Invocations"),input=total(g,mantle?"TotalInputTokens":"InputTokenCount"),output=total(g,mantle?"TotalOutputTokens":"OutputTokenCount");
  const stats=[[mantle?"Completed inferences":"Accepted requests",inv,mantle?"Total of returned datapoints":"Includes requests that later fail"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Track HTTP 429 in application logs":"Includes the effects of client retries"],["Latency p99",gaugeMetric(g,"p99")?.summary.max??null,"Highest per-period p99, in milliseconds"]];
  $("resource-stats").innerHTML=stats.map(([label,value,sub])=>`<div><label>${h(label)}</label><strong>${fmt(value)}</strong><small>${h(sub)}</small></div>`).join("");
- const q=scoped(D.quotas).find(q=>q.comparison?.metric_id&&g?.metrics.some(m=>m.id===q.comparison.metric_id));
- $("capacity-comparison").innerHTML=q?`<div class="note info"><strong>Mapped quota: ${fmt(q.applied_value)} tokens/min.</strong> Observed peak for this series: ${fmt(q.comparison.peak_per_minute)} tokens/min, equivalent to <strong>${fmt(q.comparison.peak_percent)}%</strong> of the current quota.<br><span>${h(q.comparison.reason)}</span><br><code>${h(q.quota_code)}</code> · ${h(q.name)}</div>`:"";
+ // A model can have both a token and a request quota mapped; show each with its
+ // own unit rather than picking whichever came first.
+ const mapped=scoped(D.quotas).filter(q=>q.comparison?.metric_id&&g?.metrics.some(m=>m.id===q.comparison.metric_id));
+ $("capacity-comparison").innerHTML=mapped.map(q=>{
+  const unit=q.comparison.source==="AWS/Bedrock.Invocations"?"requests/min":"tokens/min";
+  return `<div class="note info"><strong>Mapped quota: ${fmt(q.applied_value)} ${h(unit)}.</strong> Observed peak for this series: ${fmt(q.comparison.peak_per_minute)} ${h(unit)}, equivalent to <strong>${fmt(q.comparison.peak_percent)}%</strong> of the current quota.<br><span>${h(q.comparison.reason)}</span><br><code>${h(q.quota_code)}</code> · ${h(q.name)}</div>`;
+ }).join("");
  const canvas=$("chart"),rect=canvas.getBoundingClientRect();if(!rect.width)return;
  const ratio=window.devicePixelRatio||1;canvas.width=rect.width*ratio;canvas.height=rect.height*ratio;
  const ctx=canvas.getContext("2d");ctx.scale(ratio,ratio);const w=rect.width,ht=rect.height,L=55,R=16,T=20,B=38,pw=w-L-R,ph=ht-T-B;

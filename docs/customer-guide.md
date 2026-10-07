@@ -198,6 +198,8 @@ The collector does not attach or modify IAM policies.
 
 **Quota correlations require validated mappings.** The collector uses compatible Service Quotas usage metadata and explicit Runtime/Mantle mappings listed in the [README](../README.md#how-to-interpret-the-results). Exact quota codes, names, scope and metric identities must agree. Runtime profile destinations are checked. Percentages are withheld for incomplete queries and do not guarantee coverage of all traffic sharing a quota.
 
+**Request quotas are compared with accepted requests.** A requests-per-minute quota is linked to its model by deriving the scope and model label from the quota name, then requiring that label to resolve to exactly one profile or on-demand model collected in that Region. The percentage uses `Invocations`, which counts **accepted** requests: a peak sitting at the limit while throttling is recorded means demand exceeded it, by an amount the percentage does not show. Where the label does not resolve, the report still states the accepted rate observed during the throttled intervals, and lists the request quotas whose value and scope match it as candidates to confirm with your application's errors or AWS Support.
+
 **Daily quotas are a separate diagnostic.** `Cross-Model Max Tokens Per Day` is shown prominently, but its pricing-based accounting cannot be reconstructed by summing raw token counts. Obtain quota-specific evidence and the application's exact errors.
 
 **Mantle client errors exclude early HTTP 429 responses.** Collect HTTP status, error code, timestamp, model, source Region, endpoint and request ID from the application. A zero `InferenceClientErrors` counter cannot rule out throttling.
