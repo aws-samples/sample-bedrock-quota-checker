@@ -1532,7 +1532,10 @@ const sumMetric=(g,name)=>g?.metrics.find(m=>m.metric.MetricName===name&&m.stat=
 const total=(g,name)=>sumMetric(g,name)?.summary.total??null;
 // Gauge series are not summable: report the observed maximum of the statistic.
 const statMetric=(g,name,stat)=>g?.metrics.find(m=>m.metric.MetricName===name&&m.stat===stat);
-const gaugeMetric=(g,stat)=>g?.metrics.find(m=>m.stat===stat&&GAUGE_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
+// Prefer a gauge series that returned datapoints: a group can hold several gauge
+// names (InvocationLatency, TimeToFirstToken) where only some were published.
+const gaugeMetrics=(g,stat)=>(g?.metrics||[]).filter(m=>m.stat===stat&&GAUGE_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
+const gaugeMetric=(g,stat)=>gaugeMetrics(g,stat).find(m=>m.points.length)||gaugeMetrics(g,stat)[0];
 const gaugeCell=(g,stat)=>{const m=gaugeMetric(g,stat);return m?fmt(m.summary.max)+"<small>"+h(m.metric.MetricName)+" · "+h(stat)+"</small>":fmt(null)};
 // Any discovered error or throttle counter for this group, by suffix.
 const errorMetrics=(g,suffix)=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.metric.MetricName.endsWith(suffix));
@@ -1606,7 +1609,8 @@ function renderChart(){
   [mantle?"TotalOutputTokens":"OutputTokenCount","Output","#597bea"],
   ...(mantle?[]:[["EstimatedTPMQuotaUsage","Estimated TPM","#c98536"]]),
  ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Accepted requests","#007e80"]]
- :state.mode==="latency"?[[gaugeMetric(g,"p99")?.metric.MetricName,"p99","#c06a18","p99"],[gaugeMetric(g,"Average")?.metric.MetricName,"Average","#597bea","Average"]]
+ // One gauge name for all three statistics, so the lines describe the same metric.
+ :state.mode==="latency"?(name=>[[name,"p99","#c06a18","p99"],[name,"Average","#597bea","Average"],[name,"Maximum","#b03a4a","Maximum"]])(gaugeMetric(g,"p99")?.metric.MetricName)
  // Every Sum series in the group, so a namespace with no dedicated view is still plottable.
  :state.mode==="counters"?(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length).map((m,i)=>[m.metric.MetricName,m.metric.MetricName,PALETTE[i%PALETTE.length]])
  :[["InvocationThrottles","Throttles","#c98536"]];
