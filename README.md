@@ -15,7 +15,19 @@ The collector uses an explicit allowlist of read-only AWS operations. It does no
 | **`report.html`** | Offline dashboard with charts, filters, current quotas, reported model availability, and collection quality |
 | **`quotas.csv`** | Current applied quotas and AWS defaults, stored separately, with quota codes, units, scope, and collection timestamps |
 | `report.json` | Complete structured report, including metric series and interpretation limits |
+| `metric_inventory.csv` | Per Region and namespace: the metric names and dimension names CloudWatch reported, and which names are outside the collector's curated list |
 | ZIP archive | All report files together, ready to download or share |
+
+### What the collector asks CloudWatch for
+
+Metric names and dimension sets are **discovered**, not hardcoded. For each probed namespace the collector reads `ListMetrics` and then fills the name x dimension-set matrix, so both axes come from combinations AWS already reported for your account:
+
+- **Every published metric name**, including names newer than this tool. A name outside the curated list is collected and flagged in `metric_inventory.csv`, so "not published" is distinguishable from "not requested".
+- **Dimension sets of any width**, not only single-model ones. This recovers combinations such as Mantle's `Model` + `Project`, which attribute usage and errors per application. The dimensionless account rollup is still never fabricated by expansion.
+- **Namespaces**: `AWS/Bedrock`, `AWS/BedrockMantle`, `AWS/Bedrock/Guardrails`, `AWS/Bedrock/KnowledgeBase` and `AWS/Bedrock/Agents`. A namespace your account does not publish returns an empty list, which is logged as empty rather than assumed absent. Add more with `--namespaces`.
+- **Distribution statistics for gauges.** Counters are retrieved as `Sum`. Latency-style metrics are retrieved as `Average`, `Maximum` and `p99`, because a latency has no meaningful sum. Gauge series report a maximum but no total and no per-minute rate.
+
+Discovery selects more series than a fixed list would, so `--max-metric-requests` defaults to 600. The run log prints the plan and warns before the budget truncates anything; priorities are unchanged, with error and throttle counters always retrieved first.
 
 All application-generated interface text, CLI messages, explanations, and documentation are in English. The HTML uses US English number formatting and UTC dates. Names and identifiers returned by AWS are preserved as received.
 
@@ -235,7 +247,7 @@ Use `--region-workers 1` to serialize inventory/discovery. Increasing worker cou
 ```bash
 python3 bedrock_access_report.py \
   --resume ./reports/YOUR_REPORT_DIRECTORY/report.json \
-  --max-metric-requests 200 \
+  --max-metric-requests 600 \
   --output-dir ./reports
 ```
 
@@ -281,7 +293,7 @@ This regenerates HTML, CSV, and ZIP outputs from the saved snapshot. It refreshe
 python3 bedrock_access_report.py --help
 ```
 
-Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--region-workers` for parallel discovery, `--log-level` for console and transcript verbosity, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
+Additional options include explicit `--start` and `--end` timestamps, `--model-ids`, `--namespaces` to probe CloudWatch namespaces beyond the Bedrock defaults, `--region-workers` for parallel discovery, `--log-level` for console and transcript verbosity, and collection limits through `--max-metrics`, `--max-datapoints`, and `--max-metric-requests`. `--all-enabled-regions` additionally requires `ec2:DescribeRegions`.
 
 ## How to interpret the results
 

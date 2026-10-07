@@ -110,6 +110,7 @@ The HTML report works offline, without credentials, external chart libraries, or
 | `quotas.csv` | Applied quotas and AWS defaults, kept separate |
 | `usage_summary.csv` | Usage totals, interval statistics, and supported quota comparisons |
 | `usage_timeseries.csv` | Timestamped metric data with dimensions and resolution |
+| `metric_inventory.csv` | Metric names and dimension names each Region and namespace reported, and which names the collector did not have in its curated list |
 | `collection_issues.csv` | Missing permissions, unavailable data, and other collection problems |
 | `run_log.csv` | Execution history: one row per AWS call and per collection decision, with duration, status, and budget consumed |
 | `run_log.txt` | The same run as a timestamped console transcript |
@@ -203,6 +204,12 @@ The collector does not attach or modify IAM policies.
 
 **No data is not zero usage.** Missing datapoints can reflect inactivity, unavailable metrics, retention, permissions, discovery limits, or a different Region/dimension. The report preserves those limitations.
 
+**"Not published" and "N/A" mean different things.** `metric_inventory.csv` lists the metric names each Region and namespace actually reported. A cell reading `Not published` means the namespace never reported that counter. `N/A` means the series was queried and returned no datapoints. Neither one is a zero.
+
+**Latency is a distribution, not a total.** Latency-style metrics are collected as `Average`, `Maximum` and `p99`. These are per-period statistics: CloudWatch computes each one inside its own interval, so they cannot be added up or re-aggregated into a single window-wide p99. The report shows the highest per-period value and says so.
+
+**Dimension sets are preserved as published.** Where an endpoint reports a combination such as `Model` + `Project`, that series is collected separately from the per-model one. Series with different dimensions are never added together, so the same traffic is not counted twice.
+
 **Provisioned capacity is separate.** Existing Model Units describe allocated resources. A quota on Model Units describes an allocation limit. Neither is automatically converted into on-demand RPM or TPM.
 
 ## Complete an interrupted collection
@@ -212,7 +219,7 @@ Local budget exhaustion is recorded separately from an AWS API failure. The save
 ```bash
 python3 bedrock_access_report.py \
   --resume ./reports/YOUR_REPORT_DIRECTORY/report.json \
-  --max-metric-requests 200 --output-dir ./reports
+  --max-metric-requests 600 --output-dir ./reports
 ```
 
 Use credentials for the original account. Resume preserves the original scope, resolution and quota snapshot and writes a new directory. Each attempt gets a fresh budget; it can incur CloudWatch retrieval charges. Completed windows are skipped. Interrupted windows are queried again and points deduplicated. Older v0.1.2 reports require requerying the full window for incomplete series. If that resolution has expired from CloudWatch retention, create a new report at a supported resolution.

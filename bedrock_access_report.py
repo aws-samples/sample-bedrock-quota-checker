@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 import zipfile
 import zlib
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UTC = timezone.utc
 # Narrow mappings verified against quota definitions and system profile model IDs.
 # Names are guards against changed quota semantics, not fuzzy matching rules.
@@ -80,14 +80,46 @@ REPORT_LIMITATIONS = (
     "Cross-Model Max Tokens Per Day uses pricing-based accounting, not a raw sum of token metrics; its utilization is not calculated here.",
     "Budget exhaustion is a local collection limit, not an AWS inference error. Resume incomplete queries before interpreting missing diagnostics.",
     "This collection covers only the listed Regions; global quotas may have additional usage from other source Regions.",
+    "Metric names and dimension sets come from ListMetrics; a namespace reported as empty published nothing in this account, which is not proof that the namespace does not exist.",
+    "Gauge statistics (Average, Maximum, p99) are not summable. Totals and per-minute rates are reported only for Sum series.",
+    "p99 is computed by CloudWatch over each period, so it cannot be re-aggregated across periods into a window-wide p99.",
 )
 RUNTIME_METRICS = (
     "Invocations", "InputTokenCount", "OutputTokenCount", "EstimatedTPMQuotaUsage",
     "CacheReadInputTokenCount", "CacheWriteInputTokenCount", "InvocationThrottles",
     "InvocationClientErrors", "InvocationServerErrors", "OutputImageCount",
+    "InvocationLatency",
 )
 MANTLE_METRICS = ("Inferences", "TotalInputTokens", "TotalOutputTokens", "InferenceClientErrors")
 DIAGNOSTIC_METRICS = ("InvocationThrottles", "InvocationClientErrors", "InvocationServerErrors", "InferenceClientErrors")
+# Namespaces probed with ListMetrics. A namespace that this account does not
+# publish returns an empty list: it costs one call and is logged as empty, so an
+# absent namespace is observable instead of assumed. Extend with --namespaces.
+BEDROCK_NAMESPACES = (
+    "AWS/Bedrock", "AWS/BedrockMantle", "AWS/Bedrock/Guardrails",
+    "AWS/Bedrock/KnowledgeBase", "AWS/Bedrock/Agents",
+)
+# Curated names used to probe identifiers that ListMetrics does not list. Names
+# the account does publish are discovered at runtime and added to these sets.
+CURATED_METRICS = {"AWS/Bedrock": RUNTIME_METRICS, "AWS/BedrockMantle": MANTLE_METRICS}
+# Statistics requested per metric. Counters carry their whole signal in Sum;
+# gauges such as latency need a distribution, which Sum cannot express.
+# GetMetricData accepts extended statistics (p99) directly in MetricStat.Stat.
+COUNTER_STATS = ("Sum",)
+GAUGE_STATS = ("Average", "Maximum", "p99")
+# Suffixes used ONLY to pick statistics and scheduling priority, never to infer a
+# quota mapping or to alter a reported value.
+GAUGE_SUFFIXES = ("Latency", "TimeToFirstToken", "TimeToFirstByte")
+DIAGNOSTIC_SUFFIXES = ("Errors", "Throttles")
+
+
+def stats_for(name):
+    """Statistics to request for a metric name, most significant first."""
+    return GAUGE_STATS if name.endswith(GAUGE_SUFFIXES) else COUNTER_STATS
+
+
+def is_diagnostic(name):
+    return name in DIAGNOSTIC_METRICS or name.endswith(DIAGNOSTIC_SUFFIXES)
 # Labels for the priority groups reported in the run log; see metric_priority().
 PRIORITY_LABELS = {0: "diagnostics", 1: "discovered usage", 2: "known-id probes", 3: "administrative usage"}
 BATCH_SIZE = 50
@@ -163,7 +195,7 @@ def metric_id(region, metric, stat="Sum"):
 
 def metric_priority(item):
     metric = item["metric"]
-    if metric["MetricName"] in DIAGNOSTIC_METRICS:
+    if is_diagnostic(metric["MetricName"]):
         return 0
     if metric["Namespace"] == "AWS/Usage":
         return 3
@@ -339,6 +371,11 @@ class Collector:
         self.log = RunLog(level=getattr(args, "log_level", "INFO"))
         # Regions are collected in parallel; the active phase is per thread.
         self.local = threading.local()
+        # Namespaces to probe, and the metric names each Region/namespace pair
+        # actually published, so expansion follows the account, not a fixed list.
+        self.namespaces = list(dict.fromkeys(
+            list(BEDROCK_NAMESPACES) + list(getattr(args, "namespaces", None) or [])))
+        self.discovered = {}
         self.report = {
             "schema_version": "1.0", "collector_version": VERSION,
             "mapping_rules_version": TPM_RULES_VERSION,
@@ -347,7 +384,8 @@ class Collector:
             "regions": [], "models": [], "inference_profiles": [], "provisioned_throughput": [],
             "quotas": [], "metrics": [], "collection_issues": [], "collections": [],
             "query_plan": [], "usage_skipped": args.skip_usage or args.plan,
-            "deferred_metrics": [],
+            "deferred_metrics": [], "metric_inventory": [],
+            "probed_namespaces": self.namespaces,
             "limitations": list(REPORT_LIMITATIONS),
         }
         self.metric_calls = 0
@@ -564,25 +602,52 @@ class Collector:
             if source not in candidates[key]["sources"]:
                 candidates[key]["sources"].append(source)
 
-        for namespace, names in (("AWS/Bedrock", RUNTIME_METRICS), ("AWS/BedrockMantle", MANTLE_METRICS)):
+        # Published names and dimension sets, per namespace, as ListMetrics
+        # reports them. Nothing is filtered against a hardcoded name list: a
+        # metric this account publishes is collected even if this tool predates it.
+        names_seen, dimsets_seen = defaultdict(set), defaultdict(dict)
+        for namespace in self.namespaces:
             rows = self.listing("cloudwatch", region, "list_metrics", "Metrics", "NextToken", Namespace=namespace)
             for metric in rows:
-                if metric["MetricName"] in names:
-                    add(metric, "ListMetrics")
-        # Prepare model diagnostics before any history retrieval. Discovery of
-        # activity identifies useful dimensions even when history is expensive.
-        for item in list(candidates.values()):
-            metric = item["metric"]
-            dims = metric["Dimensions"]
-            namespace = metric["Namespace"]
-            if len(dims) == 1 and dims[0]["Name"] == ("ModelId" if namespace == "AWS/Bedrock" else "Model"):
-                for name in RUNTIME_METRICS if namespace == "AWS/Bedrock" else MANTLE_METRICS:
-                    add({"Namespace": namespace, "MetricName": name, "Dimensions": dims}, "discovered_id_expansion")
+                names_seen[namespace].add(metric["MetricName"])
+                dims = sorted(metric["Dimensions"], key=lambda d: (d["Name"], d["Value"]))
+                if dims:
+                    dimsets_seen[namespace][json.dumps(dims, sort_keys=True)] = dims
+                for stat in stats_for(metric["MetricName"]):
+                    add(metric, "ListMetrics", stat)
+            unknown = sorted(names_seen[namespace] - set(CURATED_METRICS.get(namespace, ())))
+            self.log.add("INFO" if rows else "DEBUG", "discover", "metric_inventory", region,
+                         "ok" if rows else "empty_namespace",
+                         f"{namespace}: {len(names_seen[namespace])} metric name(s), "
+                         f"{len(dimsets_seen[namespace])} dimension set(s)."
+                         + (f" Not in the curated list: {', '.join(unknown)}." if unknown else ""),
+                         points=len(rows))
+            with self.lock:
+                self.report["metric_inventory"].append({
+                    "region": region, "namespace": namespace,
+                    "metric_names": sorted(names_seen[namespace]),
+                    "dimension_names": sorted({d["Name"] for dims in dimsets_seen[namespace].values() for d in dims}),
+                    "dimension_sets": len(dimsets_seen[namespace]),
+                    "not_in_curated_list": unknown,
+                })
+                self.discovered[(region, namespace)] = set(names_seen[namespace])
+        # Fill the name x dimension-set matrix per namespace. Both axes come from
+        # ListMetrics, so every probe targets a combination AWS already reported;
+        # this is what recovers multi-dimension series such as Model + Project.
+        # Prepare these before any history retrieval: discovery identifies useful
+        # dimensions even when retrieving their history is expensive.
+        for namespace, dimsets in dimsets_seen.items():
+            for name in sorted(names_seen[namespace] | set(CURATED_METRICS.get(namespace, ()))):
+                for dims in dimsets.values():
+                    for stat in stats_for(name):
+                        add({"Namespace": namespace, "MetricName": name, "Dimensions": dims},
+                            "discovered_id_expansion", stat)
         # Account-level diagnostics include failures without a resolved ModelId.
         if (any(m["metric"]["Namespace"] == "AWS/Bedrock" for m in candidates.values())
                 or self.args.model_ids or getattr(self.args, "include_inactive_models", False)):
-            for name in RUNTIME_METRICS:
-                add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": []}, "account_probe")
+            for name in set(RUNTIME_METRICS) | names_seen.get("AWS/Bedrock", set()):
+                for stat in stats_for(name):
+                    add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": []}, "account_probe", stat)
         for quota in self.report["quotas"]:
             usage = quota.get("usage_metric")
             if quota["region"] != region or not usage:
@@ -600,10 +665,11 @@ class Collector:
             quota["usage_metric_id"] = metric_id(region, metric, stat)
         # Query documented ModelId series even if ListMetrics has not listed them.
         for model_id_value in self.args.model_ids or []:
-            for name in RUNTIME_METRICS:
-                add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": [
-                    {"Name": "ModelId", "Value": model_id_value},
-                ]}, "explicit_model_id")
+            for name in set(RUNTIME_METRICS) | names_seen.get("AWS/Bedrock", set()):
+                for stat in stats_for(name):
+                    add({"Namespace": "AWS/Bedrock", "MetricName": name, "Dimensions": [
+                        {"Name": "ModelId", "Value": model_id_value},
+                    ]}, "explicit_model_id", stat)
         known_ids = set()
         if getattr(self.args, "include_inactive_models", False):
             known_ids.update(m["modelId"] for m in self.report["models"] if m["region"] == region)
@@ -657,26 +723,24 @@ class Collector:
                 continue
             dimensions = observed["metric"]["Dimensions"]
             namespace = observed["metric"]["Namespace"]
-            # Probe only documented single-model dimensions; do not fabricate rollups.
-            if len(dimensions) != 1:
+            # Expand the dimension sets this identifier actually published, of any
+            # width, so combinations such as Model + Project are not lost. The
+            # account rollup is still excluded: do not fabricate aggregates.
+            if not dimensions or namespace not in self.namespaces:
                 continue
-            if namespace == "AWS/Bedrock" and dimensions[0]["Name"] == "ModelId":
-                names = RUNTIME_METRICS
-            elif namespace == "AWS/BedrockMantle" and dimensions[0]["Name"] == "Model":
-                names = MANTLE_METRICS
-            else:
-                continue
-            for name in names:
-                metric = {"Namespace": namespace, "MetricName": name, "Dimensions": dimensions}
-                key = metric_id(region, metric)
-                if key in existing:
-                    continue
-                existing.add(key)
-                candidates.append({
-                    "id": key, "region": region, "metric": metric, "stat": "Sum",
-                    "period_seconds": self.period, "sources": ["observed_id_expansion"],
-                    "points": [], "status": "not_queried", "messages": [],
-                })
+            names = set(CURATED_METRICS.get(namespace, ())) | self.discovered.get((region, namespace), set())
+            for name in sorted(names):
+                for stat in stats_for(name):
+                    metric = {"Namespace": namespace, "MetricName": name, "Dimensions": dimensions}
+                    key = metric_id(region, metric, stat)
+                    if key in existing:
+                        continue
+                    existing.add(key)
+                    candidates.append({
+                        "id": key, "region": region, "metric": metric, "stat": stat,
+                        "period_seconds": self.period, "sources": ["observed_id_expansion"],
+                        "points": [], "status": "not_queried", "messages": [],
+                    })
         return candidates
 
     def fetch_metrics(self, region, metrics):
@@ -923,6 +987,11 @@ class Collector:
         if identity is None or identity["Account"] != saved["account_id"] or identity["Arn"].split(":")[1] != saved["partition"]:
             raise ValueError("Resume requires credentials for the original account and partition.")
         self.report = copy.deepcopy(saved)
+        # A report saved before namespace/stat discovery has neither key.
+        self.report.setdefault("metric_inventory", [])
+        self.report.setdefault("probed_namespaces", self.namespaces)
+        for entry in self.report["metric_inventory"]:
+            self.discovered[(entry["region"], entry["namespace"])] = set(entry["metric_names"])
         self.report.setdefault("previous_attempts", []).append({
             "completed_at": saved.get("completed_at"),
             "collector_version": saved.get("resume_collector_version", saved["collector_version"]),
@@ -977,6 +1046,9 @@ def analyze(report):
     report["limitations"] = list(REPORT_LIMITATIONS)
     report["language"] = "en"
     report["renderer_version"] = VERSION
+    # Reports saved before namespace/statistic discovery carry neither key.
+    report.setdefault("metric_inventory", [])
+    report.setdefault("probed_namespaces", list(BEDROCK_NAMESPACES))
     expected = int((datetime.fromisoformat(report["end"].replace("Z","+00:00")) -
                     datetime.fromisoformat(report["start"].replace("Z","+00:00"))).total_seconds() /
                    report["period_seconds"])
@@ -1065,6 +1137,7 @@ def analyze(report):
     for region in report.get("regions", []):
         metrics = [m for m in report["metrics"] if m["region"] == region]
         throttles = [m for m in metrics if m["metric"]["Namespace"] == "AWS/Bedrock" and m["metric"]["MetricName"] == "InvocationThrottles"]
+        observed = [m for m in metrics if m["points"]]
         report["diagnostic_coverage"].append({
             "region": region,
             "runtime_throttle_series": len(throttles),
@@ -1072,6 +1145,14 @@ def analyze(report):
             "incomplete_series": sum(m["status"] not in ("ok", "no_data") for m in metrics),
             "deferred_series": sum(m["region"] == region for m in report.get("deferred_metrics", [])),
             "mantle_requires_application_errors": any(m["metric"]["Namespace"] == "AWS/BedrockMantle" for m in metrics),
+            # What this Region actually published, so an absent signal is
+            # distinguishable from a signal this tool did not request.
+            "namespaces_with_data": sorted({m["metric"]["Namespace"] for m in observed}),
+            "diagnostic_metric_names": sorted({m["metric"]["MetricName"] for m in metrics
+                                               if is_diagnostic(m["metric"]["MetricName"])}),
+            "gauge_metric_names": sorted({m["metric"]["MetricName"] for m in metrics if m["stat"] != "Sum"}),
+            "statistics_collected": sorted({m["stat"] for m in metrics}),
+            "multi_dimension_series": sum(len(m["metric"]["Dimensions"]) > 1 for m in metrics),
         })
 
 
@@ -1109,6 +1190,8 @@ def export(report, directory, collect_only=False):
         ("provisioned_throughput", ["region", "provisionedModelArn", "provisionedModelName", "status", "modelUnits", "desiredModelUnits", "modelArn", "foundationModelArn"]),
         ("quotas", ["region", "quota_code", "name", "applied_value", "default_value", "unit", "adjustable", "global", "level", "context", "period", "source", "collected_at", "usage_metric", "comparison", "error_reason"]),
         ("collection_issues", ["region", "operation", "status", "resource", "message"]),
+        ("metric_inventory", ["region", "namespace", "metric_names", "dimension_names",
+                              "dimension_sets", "not_in_curated_list"]),
     ]
     for key, fields in definitions:
         atomic_text(directory/f"{key}.csv", csv_text(report[key], fields))
@@ -1186,6 +1269,9 @@ def parser():
     result.add_argument("--end", help="History end in ISO 8601 format (default: five minutes ago)")
     result.add_argument("--period", default="auto", choices=["auto", "60", "300", "3600"], help="Metric period in seconds; auto respects retention")
     result.add_argument("--model-ids", nargs="+", help="Additional runtime metric IDs to query")
+    result.add_argument("--namespaces", nargs="+", metavar="NAMESPACE",
+                        help="Extra CloudWatch namespaces to probe in addition to the Bedrock defaults "
+                             f"({', '.join(BEDROCK_NAMESPACES)})")
     result.add_argument("--include-inactive-models", action="store_true", help="Also probe the entire catalog for historical activity (higher collection cost)")
     result.add_argument("--include-api-usage", action="store_true", help="Also collect administrative AWS/Usage metrics referenced by quotas")
     result.add_argument("--output-dir", default="./reports", help="Parent directory for generated reports (default: ./reports)")
@@ -1194,7 +1280,9 @@ def parser():
     result.add_argument("--plan", action="store_true", help="Read inventory/metric identities without fetching datapoints")
     result.add_argument("--max-metrics", type=int, default=3000, help="Maximum selected series per attempt; deferred identities are saved for resume (default: 3000)")
     result.add_argument("--max-datapoints", type=int, default=2000000, help="Returned datapoint limit, checked between responses (default: 2000000)")
-    result.add_argument("--max-metric-requests", type=int, default=200, help="Maximum GetMetricData calls per run (default: 200)")
+    result.add_argument("--max-metric-requests", type=int, default=600,
+                        help="Maximum GetMetricData calls per run (default: 600). Discovery now fills the "
+                             "metric x dimension-set matrix, so a run selects more series than before")
     result.add_argument("--log-level", choices=sorted(LOG_LEVELS, key=LOG_LEVELS.get), default="INFO",
                         help="Console and run_log.txt verbosity; run_log.csv always keeps every event (default: INFO)")
     result.add_argument("--collect-only", action="store_true", help="Save data without rendering HTML")
@@ -1380,7 +1468,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
   <div id="run-notice"></div>
   <div class="panel">
    <div class="panel-head"><div><h2>Usage over time</h2><p>One identifier at a time, preserving the original metric dimensions.</p></div><select id="resource" class="resource-select" aria-label="Model or profile to display"></select></div>
-   <div class="panel-head"><div class="tabs" id="chart-tabs"><button data-mode="tokens" class="active">Tokens</button><button data-mode="requests">Requests</button><button data-mode="throttles">Throttles</button></div><span class="muted text-xs" id="chart-unit"></span></div>
+   <div class="panel-head"><div class="tabs" id="chart-tabs"><button data-mode="tokens" class="active">Tokens</button><button data-mode="requests">Requests</button><button data-mode="throttles">Throttles</button><button data-mode="latency">Latency</button><button data-mode="counters">All counters</button></div><span class="muted text-xs" id="chart-unit"></span></div>
    <div class="chart"><canvas id="chart" role="img" aria-label="Observed usage during the reporting period"></canvas><div class="tooltip" id="tooltip" hidden></div></div>
    <div class="legend" id="legend"></div>
    <p class="muted text-xs" id="chart-method"></p>
@@ -1434,9 +1522,27 @@ const day=v=>new Date(v).toLocaleDateString("en-US",{timeZone:"UTC",day:"2-digit
 const badge=(text,kind="")=>`<span class="badge ${h(kind)}">${h(text)}</span>`;
 const table=(heads,rows)=>`<table><thead><tr>${heads.map((x,i)=>`<th>${h(x)}</th>`).join("")}</tr></thead><tbody>${rows.join("")||`<tr><td colspan="${heads.length}" class="empty">No results for these filters.</td></tr>`}</tbody></table>`;
 const state={tab:"overview",region:D.regions[0],mode:"tokens",resource:"",pages:{}};
+// Mirrors GAUGE_SUFFIXES in the collector: names whose statistics are not sums.
+const GAUGE_SUFFIXES=["Latency","TimeToFirstToken","TimeToFirstByte"];
+const PALETTE=["#007e80","#597bea","#c06a18","#8a5cb8","#2f8f5b","#b03a4a","#4a7c93","#9a7d1e"];
+// Short endpoint label per namespace, so a namespace added later is not mislabelled.
+const endpointLabel=ns=>ns==="AWS/Bedrock"?"runtime":ns==="AWS/BedrockMantle"?"mantle":ns.replace(/^AWS\/Bedrock\/?/,"").toLowerCase()||"bedrock";
 const scoped=rows=>rows.filter(r=>r.region===state.region);
 const sumMetric=(g,name)=>g?.metrics.find(m=>m.metric.MetricName===name&&m.stat==="Sum");
 const total=(g,name)=>sumMetric(g,name)?.summary.total??null;
+// Gauge series are not summable: report the observed maximum of the statistic.
+const statMetric=(g,name,stat)=>g?.metrics.find(m=>m.metric.MetricName===name&&m.stat===stat);
+const gaugeMetric=(g,stat)=>g?.metrics.find(m=>m.stat===stat&&GAUGE_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
+const gaugeCell=(g,stat)=>{const m=gaugeMetric(g,stat);return m?fmt(m.summary.max)+"<small>"+h(m.metric.MetricName)+" · "+h(stat)+"</small>":fmt(null)};
+// Any discovered error or throttle counter for this group, by suffix.
+const errorMetrics=(g,suffix)=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.metric.MetricName.endsWith(suffix));
+const errorCell=(g,suffix)=>{const list=errorMetrics(g,suffix);return list.length?list.map(m=>fmt(m.summary.total)+"<small>"+h(m.metric.MetricName)+"</small>").join(""):"Not published"};
+const ERROR_SUFFIXES=["Throttles","ClientErrors","ServerErrors"];
+// Sum series this namespace publishes that no dedicated column covers, so a
+// namespace the report did not previously know about is still readable.
+const namedColumns=g=>{const mantle=g?.namespace==="AWS/BedrockMantle";return mantle?["Inferences","TotalInputTokens","TotalOutputTokens"]:["Invocations","InputTokenCount","OutputTokenCount"]};
+const otherCounters=g=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length&&!namedColumns(g).includes(m.metric.MetricName)&&!ERROR_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
+const otherCell=g=>{const list=otherCounters(g);return list.length?list.map(m=>fmt(m.summary.total)+"<small>"+h(m.metric.MetricName)+"</small>").join(""):fmt(null)};
 const totalCell=(g,name)=>fmt(total(g,name))+(sumMetric(g,name)&&!["ok","no_data"].includes(sumMetric(g,name).status)?"<small>Incomplete query</small>":"");
 let groups=[],chartData=null;
 
@@ -1449,15 +1555,22 @@ function pagination(name,rows,draw,container,pager,size=15){
 }
 function buildGroups(){
  const map=new Map();
- for(const m of scoped(D.metrics).filter(m=>m.stat==="Sum"&&["AWS/Bedrock","AWS/BedrockMantle"].includes(m.metric.Namespace))){
+ // Group every probed namespace, not just the two original ones, and keep gauge
+ // statistics in the group so latency is reachable alongside the counters.
+ for(const m of scoped(D.metrics).filter(m=>m.metric.Namespace!=="AWS/Usage")){
   const dims=m.metric.Dimensions,key=m.region+"|"+m.metric.Namespace+"|"+JSON.stringify(dims);
-  if(!map.has(key)){const identifier=dims.find(d=>d.Name==="ModelId"||d.Name==="Model")?.Value||"Account aggregate";
-   map.set(key,{key,id:identifier,namespace:m.metric.Namespace,dims,metrics:[],extra:dims.filter(d=>d.Name!=="ModelId"&&d.Name!=="Model").map(d=>d.Name+"="+d.Value).join(", ")});
+  if(!map.has(key)){
+   // The identifier is the model dimension when present, otherwise the first
+   // dimension of the set. Whichever it is, do not repeat it in `extra`.
+   const idDim=dims.find(d=>d.Name==="ModelId"||d.Name==="Model")||dims[0];
+   map.set(key,{key,id:idDim?.Value||"Account aggregate",namespace:m.metric.Namespace,dims,metrics:[],
+    endpoint:endpointLabel(m.metric.Namespace),
+    extra:dims.filter(d=>d!==idDim).map(d=>d.Name+"="+d.Value).join(", ")});
   }map.get(key).metrics.push(m);
  }
  groups=[...map.values()].filter(g=>g.metrics.some(m=>m.points.length)).sort((a,b)=>((total(b,"Invocations")??total(b,"Inferences")??0)-(total(a,"Invocations")??total(a,"Inferences")??0))||a.id.localeCompare(b.id));
  if(!groups.some(g=>g.key===state.resource))state.resource=groups[0]?.key||"";
- $("resource").innerHTML=groups.length?groups.map(g=>`<option value="${h(g.key)}">${h(g.id)}${g.extra?" · "+h(g.extra):""} · ${g.namespace==="AWS/BedrockMantle"?"mantle":"runtime"}</option>`).join(""):'<option>No series returned datapoints</option>';
+ $("resource").innerHTML=groups.length?groups.map(g=>`<option value="${h(g.key)}">${h(g.id)}${g.extra?" · "+h(g.extra):""} · ${h(g.endpoint)}</option>`).join(""):'<option>No series returned datapoints</option>';
  $("resource").value=state.resource;
 }
 function renderOverview(){
@@ -1477,9 +1590,11 @@ function renderOverview(){
  const daily=quotas.find(q=>q.quota_code==="L-E3F10727"&&q.name==="Cross-Model Max Tokens Per Day");
  if(daily)notices+=`<div class="note info"><strong>Daily cross-model quota: ${fmt(daily.applied_value)}.</strong> AWS default: ${fmt(daily.default_value)}. Utilization is unavailable: this quota uses pricing-based accounting, not a raw sum of token metrics.</div>`;
  $("run-notice").innerHTML=notices;
- const renderRows=items=>table(["Identifier","Endpoint","Accepted / completed requests","Input tokens","Output tokens","Throttles","Client errors","Server errors"],items.map(g=>{
+ const renderRows=items=>table(["Identifier","Endpoint","Accepted / completed requests","Input tokens","Output tokens","Latency p99","Throttles","Client errors","Server errors","Other published counters"],items.map(g=>{
   const mantle=g.namespace==="AWS/BedrockMantle";
-  return `<tr><td><strong>${h(g.id)}</strong><small>${h(g.extra||(g.dims.length?"Model dimension":"Aggregate series, without dimensions"))}</small></td><td>${badge(mantle?"mantle":"runtime")}</td><td>${totalCell(g,mantle?"Inferences":"Invocations")}</td><td>${totalCell(g,mantle?"TotalInputTokens":"InputTokenCount")}</td><td>${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td><td>${mantle?"Application logs required":totalCell(g,"InvocationThrottles")}</td><td>${totalCell(g,mantle?"InferenceClientErrors":"InvocationClientErrors")}</td><td>${mantle?"Not collected":totalCell(g,"InvocationServerErrors")}</td></tr>`;
+  // Error and throttle counters are matched by suffix, so a counter this
+  // namespace publishes appears even if it is not in the curated list.
+  return `<tr><td><strong>${h(g.id)}</strong><small>${h(g.extra||(g.dims.length?g.dims.map(d=>d.Name).join(" + "):"Aggregate series, without dimensions"))}</small></td><td>${badge(g.endpoint)}</td><td>${totalCell(g,mantle?"Inferences":"Invocations")}</td><td>${totalCell(g,mantle?"TotalInputTokens":"InputTokenCount")}</td><td>${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td><td>${gaugeCell(g,"p99")}</td><td>${errorCell(g,"Throttles")}</td><td>${errorCell(g,"ClientErrors")}</td><td>${errorCell(g,"ServerErrors")}</td><td>${otherCell(g)}</td></tr>`;
  }));
  pagination("usage",groups,renderRows,"usage-table","usage-page");
  renderChart();
@@ -1490,12 +1605,19 @@ function renderChart(){
   [mantle?"TotalInputTokens":"InputTokenCount","Input","#007e80"],
   [mantle?"TotalOutputTokens":"OutputTokenCount","Output","#597bea"],
   ...(mantle?[]:[["EstimatedTPMQuotaUsage","Estimated TPM","#c98536"]]),
- ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Accepted requests","#007e80"]]:[["InvocationThrottles","Throttles","#c98536"]];
- const series=definitions.map(([name,label,color])=>({name,label,color,metric:sumMetric(g,name)})).filter(s=>s.metric?.points.length);
- $("chart-unit").textContent=state.mode==="tokens"?"tokens / min":state.mode==="requests"?"requests / min":"throttles / min";
- $("legend").innerHTML=definitions.map(([name,label,color])=>`<span><i class="dot" data-color="${h(color)}"></i>${h(label)}${!sumMetric(g,name)?.points.length?" · no data":""}</span>`).join("");
+ ]:state.mode==="requests"?[[mantle?"Inferences":"Invocations",mantle?"Completed inferences":"Accepted requests","#007e80"]]
+ :state.mode==="latency"?[[gaugeMetric(g,"p99")?.metric.MetricName,"p99","#c06a18","p99"],[gaugeMetric(g,"Average")?.metric.MetricName,"Average","#597bea","Average"]]
+ // Every Sum series in the group, so a namespace with no dedicated view is still plottable.
+ :state.mode==="counters"?(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length).map((m,i)=>[m.metric.MetricName,m.metric.MetricName,PALETTE[i%PALETTE.length]])
+ :[["InvocationThrottles","Throttles","#c98536"]];
+ // A gauge is plotted as-is; only Sum counters are converted to a per-minute rate.
+ const gauge=state.mode==="latency";
+ const pick=(name,stat)=>name?(stat?statMetric(g,name,stat):sumMetric(g,name)):null;
+ const series=definitions.map(([name,label,color,stat])=>({name,label,color,stat,metric:pick(name,stat)})).filter(s=>s.metric?.points.length);
+ $("chart-unit").textContent=gauge?"milliseconds (per-period statistic)":state.mode==="tokens"?"tokens / min":state.mode==="requests"?"requests / min":state.mode==="counters"?"metric units / min · scales differ per series":"throttles / min";
+ $("legend").innerHTML=definitions.map(([name,label,color,stat])=>`<span><i class="dot" data-color="${h(color)}"></i>${h(label)}${!pick(name,stat)?.points.length?" · no data":""}</span>`).join("");
  const inv=total(g,mantle?"Inferences":"Invocations"),input=total(g,mantle?"TotalInputTokens":"InputTokenCount"),output=total(g,mantle?"TotalOutputTokens":"OutputTokenCount");
- const stats=[[mantle?"Completed inferences":"Accepted requests",inv,mantle?"Total of returned datapoints":"Includes requests that later fail"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Track HTTP 429 in application logs":"Includes the effects of client retries"]];
+ const stats=[[mantle?"Completed inferences":"Accepted requests",inv,mantle?"Total of returned datapoints":"Includes requests that later fail"],["Input tokens",input,mantle?"Billable tokens":"InputTokenCount metric; cache reported separately"],["Output tokens",output,"Observed volume, without a quota multiplier"],["Throttles",mantle?null:total(g,"InvocationThrottles"),mantle?"Track HTTP 429 in application logs":"Includes the effects of client retries"],["Latency p99",gaugeMetric(g,"p99")?.summary.max??null,"Highest per-period p99, in milliseconds"]];
  $("resource-stats").innerHTML=stats.map(([label,value,sub])=>`<div><label>${h(label)}</label><strong>${fmt(value)}</strong><small>${h(sub)}</small></div>`).join("");
  const q=scoped(D.quotas).find(q=>q.comparison?.metric_id&&g?.metrics.some(m=>m.id===q.comparison.metric_id));
  $("capacity-comparison").innerHTML=q?`<div class="note info"><strong>Mapped quota: ${fmt(q.applied_value)} tokens/min.</strong> Observed peak for this series: ${fmt(q.comparison.peak_per_minute)} tokens/min, equivalent to <strong>${fmt(q.comparison.peak_percent)}%</strong> of the current quota.<br><span>${h(q.comparison.reason)}</span><br><code>${h(q.quota_code)}</code> · ${h(q.name)}</div>`:"";
@@ -1506,16 +1628,16 @@ function renderChart(){
  if(!series.length){ctx.fillStyle="#607780";ctx.textAlign="center";ctx.fillText("No datapoints are available for this selection.",w/2,ht/2);$("chart-method").textContent="Missing data is not interpreted as zero.";chartData=null;return;}
  const start=Date.parse(D.start),end=Date.parse(D.end),bins=Math.min(168,Math.max(24,Math.floor(pw/5))),step=(end-start)/bins;
  let max=0;
- for(const s of series){s.values=Array(bins).fill(null);for(const [t,v] of s.metric.points){const i=Math.floor((Date.parse(t)-start)/step);if(i>=0&&i<bins){const value=v*60/D.period_seconds;s.values[i]=s.values[i]===null?value:Math.max(value,s.values[i]);max=Math.max(max,value)}}}
+ for(const s of series){s.values=Array(bins).fill(null);for(const [t,v] of s.metric.points){const i=Math.floor((Date.parse(t)-start)/step);if(i>=0&&i<bins){const value=gauge?v:v*60/D.period_seconds;s.values[i]=s.values[i]===null?value:Math.max(value,s.values[i]);max=Math.max(max,value)}}}
  const ymax=max>0?max*1.14:1;
  for(let i=0;i<=4;i++){const y=T+ph-i*ph/4;ctx.strokeStyle="#e7eff0";ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(w-R,y);ctx.stroke();ctx.fillStyle="#718890";ctx.textAlign="right";ctx.fillText(compact(ymax*i/4),L-9,y+4);}
  const width=pw/bins;
  for(let si=0;si<series.length;si++){const s=series[si];ctx.fillStyle=s.color;ctx.globalAlpha=.82;for(let i=0;i<bins;i++){if(s.values[i]===null)continue;const x=L+i*width+si*width/series.length+.5,height=Math.max(1,s.values[i]/ymax*ph);ctx.fillRect(x,T+ph-height,Math.max(.8,width/series.length-1),height)}}ctx.globalAlpha=1;
  ctx.fillStyle="#718890";for(let i=0;i<=4;i++){ctx.textAlign=i===0?"left":i===4?"right":"center";ctx.fillText(day(start+(end-start)*i/4),L+pw*i/4,ht-10);}
- const resolution=D.period_seconds===60?"1-minute peaks":`maximum per-minute averages within ${D.period_seconds/60}-minute intervals`;
+ const resolution=gauge?`the highest per-period value in each bucket; a per-period statistic cannot be re-aggregated into a window-wide one`:D.period_seconds===60?"1-minute peaks":`maximum per-minute averages within ${D.period_seconds/60}-minute intervals`;
  $("chart-method").textContent=`Displayed in ${bins} buckets: ${resolution}. ${series.some(s=>s.metric.status!=="ok")?"Incomplete query: these totals and peaks cover only returned data. ":""}Gaps remain missing; no interpolation is applied. Returned data is available in the CSV.`;
- chartData={series,start,step,bins,L,T,pw,ph,width,w};
- canvas.setAttribute("aria-label",`${state.mode}, ${g?.id||""}, from ${day(start)} to ${day(end)}. Observed maximum: ${fmt(max)} per minute.`);
+ chartData={series,start,step,bins,L,T,pw,ph,width,w,unit:gauge?" ms":" / min"};
+ canvas.setAttribute("aria-label",`${state.mode}, ${g?.id||""}, from ${day(start)} to ${day(end)}. Observed maximum: ${fmt(max)}${gauge?" milliseconds":" per minute"}.`);
 }
 function renderQuotas(){
  const search=$("quota-search").value.toLowerCase(),kind=$("quota-kind").value,adjust=$("quota-adjustable").value;
@@ -1595,7 +1717,7 @@ $("resource").onchange=()=>{state.resource=$("resource").value;renderChart()};
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".section").forEach(x=>x.classList.toggle("active",x.id===state.tab));if(state.tab==="overview")renderChart();window.scrollTo({top:0,behavior:"smooth"})});
 document.querySelectorAll("#chart-tabs button").forEach(b=>b.onclick=()=>{state.mode=b.dataset.mode;document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x===b));renderChart()});
 for(const [ids,key,fn] of [[["quota-search","quota-kind","quota-adjustable"],"quota",renderQuotas],[["model-search"],"model",renderModels],[["profile-search"],"profile",renderProfiles],[["log-search","log-level","log-phase"],"runlog",renderRunLog]])for(const id of ids)$(id).addEventListener("input",()=>{state.pages[key]=0;fn()});
-$("chart").onmousemove=event=>{if(!chartData)return;const c=chartData,rect=$("chart").getBoundingClientRect(),x=event.clientX-rect.left,i=Math.floor((x-c.L)/c.width),tip=$("tooltip");if(i<0||i>=c.bins){tip.hidden=true;return}tip.innerHTML=`<strong>${h(when(c.start+i*c.step))}</strong><br>`+c.series.map(s=>`${h(s.label)}: ${s.values[i]===null?"no data":fmt(s.values[i])+" / min"}`).join("<br>");tip.hidden=false;tip.style.left=Math.min(Math.max(0,x+10),Math.max(0,c.w-290))+"px";tip.style.top="15px"};
+$("chart").onmousemove=event=>{if(!chartData)return;const c=chartData,rect=$("chart").getBoundingClientRect(),x=event.clientX-rect.left,i=Math.floor((x-c.L)/c.width),tip=$("tooltip");if(i<0||i>=c.bins){tip.hidden=true;return}tip.innerHTML=`<strong>${h(when(c.start+i*c.step))}</strong><br>`+c.series.map(s=>`${h(s.label)}: ${s.values[i]===null?"no data":fmt(s.values[i])+c.unit}`).join("<br>");tip.hidden=false;tip.style.left=Math.min(Math.max(0,x+10),Math.max(0,c.w-290))+"px";tip.style.top="15px"};
 $("chart").onmouseleave=()=>{$("tooltip").hidden=true};
 let resizeTimer;window.addEventListener("resize",()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(renderChart,100)});
 refresh();
