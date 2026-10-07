@@ -1411,7 +1411,7 @@ HTML = r"""<!doctype html>
 <meta http-equiv="Content-Security-Policy" content="__REPORT_CSP__">
 <title>Bedrock · Quotas & usage</title>
 <style>
-:root{--ink:#132a32;--muted:#607780;--teal:#007e80;--border:#dde7e8;--paper:#f4f7f7;--orange:#c06a18;--blue:#597bea}
+:root{--ink:#132a32;--muted:#607780;--teal:#007e80;--border:#dde7e8;--paper:#f4f7f7;--orange:#c06a18;--blue:#597bea;--brick:#a3333d;--faint:#93a7ad}
 *{box-sizing:border-box}body{margin:0;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--paper);color:var(--ink)}
 button,input,select{font:inherit}button,a,select{touch-action:manipulation}button{cursor:pointer}a{color:var(--teal)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #4d99ea;outline-offset:3px}
 aside{position:fixed;inset:0 auto 0 0;width:228px;background:#112e37;color:#dbe8eb;padding:32px 22px;display:flex;flex-direction:column}
@@ -1431,10 +1431,24 @@ select,input{border:1px solid #ccdadd;background:#fff;border-radius:7px;padding:
 .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:22px 0}.card{border:1px solid var(--border);border-radius:12px;background:#fff;padding:20px 22px;min-width:0}.card label{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted)}.card strong{display:block;font-size:32px;font-weight:650;letter-spacing:-.8px;margin:7px 0}.card small{display:block;color:var(--muted);font-size:11px}
 .panel{background:white;border:1px solid var(--border);border-radius:12px;padding:24px;margin:20px 0}.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:20px;flex-wrap:wrap}.panel-head p{color:var(--muted);font-size:12px;margin:0}.resource-select{max-width:470px;width:100%;font-size:12px}
 .note{border-left:3px solid #d0a050;background:#fcf7ec;color:#775820;border-radius:0 7px 7px 0;padding:13px 17px;font-size:12px;margin:18px 0}.info{border-left-color:#64a9af;background:#edf5f5;color:#43646b}
-.tabs{display:flex;gap:5px;background:var(--paper);border:1px solid var(--border);padding:4px;border-radius:8px}.tabs button{border:0;background:transparent;border-radius:5px;padding:6px 11px;color:var(--muted);font-size:12px}.tabs .active{background:white;box-shadow:0 1px 3px #172a3212;color:var(--ink)}
+.tabs{display:flex;flex-wrap:wrap;gap:5px;background:var(--paper);border:1px solid var(--border);padding:4px;border-radius:8px}.tabs button{border:0;background:transparent;border-radius:5px;padding:6px 11px;color:var(--muted);font-size:12px}.tabs .active{background:white;box-shadow:0 1px 3px #172a3212;color:var(--ink)}
 .chart{height:280px;position:relative}.chart canvas{width:100%;height:100%}.legend{display:flex;flex-wrap:wrap;gap:18px;font-size:11px;color:var(--muted);margin:12px 0}.dot{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}.tooltip{position:absolute;pointer-events:none;background:#112e37;color:#fff;border-radius:7px;padding:10px 13px;font-size:11px;box-shadow:0 4px 15px #0002;z-index:2;max-width:290px;white-space:normal}
 .mini-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px;padding-top:20px;border-top:1px solid var(--border);margin-top:14px}.mini-grid label{font-size:11px;color:var(--muted)}.mini-grid strong{display:block;font-size:22px;margin:3px 0}.mini-grid small{display:block;color:var(--muted);font-size:10px}
-.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:12px}th{text-align:left;color:var(--muted);background:#f5f8f8;font-size:10px;letter-spacing:.5px;text-transform:uppercase;padding:12px;font-weight:650;white-space:nowrap}td{padding:13px 12px;border-bottom:1px solid #edf1f2;vertical-align:top}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}td strong{font-size:12px}td small{display:block;font-size:10px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}tbody tr:hover{background:#fbfdfd}code{font-size:11px;color:#54727b;overflow-wrap:anywhere}
+.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:12px}th{text-align:left;color:var(--muted);background:#f5f8f8;font-size:10px;letter-spacing:.5px;text-transform:uppercase;padding:12px;font-weight:650;white-space:nowrap}td{padding:13px 12px;border-bottom:1px solid #edf1f2;vertical-align:top}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}td strong{font-size:12px}
+/* Absence recedes; a recorded rejection or failure is the only coloured number in
+   the row, and the row carries a rule on its left edge so a grid of healthy
+   identifiers reads as a pattern before any figure is parsed. */
+.quiet{color:var(--faint)}
+.chips{display:flex;flex-direction:column;gap:5px}
+.chip{display:flex;align-items:baseline;gap:6px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.chip b{font-weight:680;letter-spacing:-.1px}
+.chip em{font-size:10px;color:var(--muted);font-style:normal}
+.chip.warn b{color:var(--orange)}.chip.bad b{color:var(--brick)}
+tr.flagged td:first-child{box-shadow:inset 3px 0 0 var(--orange)}
+tr.flagged.bad td:first-child{box-shadow:inset 3px 0 0 var(--brick)}
+#usage-table td:first-child{min-width:210px}
+.more{appearance:none;border:0;background:none;padding:0;font:inherit;font-size:11px;color:var(--teal);cursor:pointer;text-align:left}
+.more:hover{text-decoration:underline}td small{display:block;font-size:10px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}tbody tr:hover{background:#fbfdfd}code{font-size:11px;color:#54727b;overflow-wrap:anywhere}
 .badge{display:inline-block;padding:3px 7px;border-radius:5px;font-size:10px;background:#eef3f4;color:#57727a;white-space:nowrap}.badge.good{background:#e9f5ed;color:#217348}.badge.warn{background:#fff3df;color:#935d15}.badge.bad{background:#fbece7;color:#a34f36}
 .pagebar{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-top:16px;font-size:12px;color:var(--muted)}.pagebar button{background:#fff;border:1px solid var(--border);padding:6px 12px;border-radius:6px;margin-left:5px}.pagebar button:disabled{opacity:.4;cursor:default}
 .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.empty{text-align:center;color:var(--muted);padding:45px 24px}.empty strong{display:block;color:var(--ink);font-size:17px;margin:8px}.quality-list{margin:0;padding-left:18px;color:var(--muted);font-size:12px}.quality-list li{margin:9px 0}.section{display:none}.section.active{display:block}.footer{margin-top:30px;color:#7a9198;font-size:11px;border-top:1px solid var(--border);padding-top:18px}
@@ -1476,7 +1490,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
    <div id="capacity-comparison"></div>
   </div>
   <div class="note">Historical usage is compared with today's quotas. Token estimates do not reproduce the <code>max_tokens</code> reservations used for capacity control. A low estimate does not rule out throttling.</div>
-  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic.</p></div><a href="usage_summary.csv" download class="text-sm">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><div class="pagebar" id="usage-page"></div></div>
+  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic. A rule on the left edge marks a row that recorded a rejection or a failure.</p></div><a href="usage_summary.csv" download class="text-sm">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><div class="pagebar" id="usage-page"></div></div>
  </section>
  <section class="section" id="quotas">
   <div class="panel"><div class="panel-head"><div><h2>Current quotas</h2><p>Applied values and AWS defaults are kept separate.</p></div></div>
@@ -1520,7 +1534,9 @@ const compact=v=>new Intl.NumberFormat("en-US",{notation:"compact",maximumFracti
 const when=v=>new Date(v).toLocaleString("en-US",{timeZone:"UTC",dateStyle:"short",timeStyle:"short"})+" UTC";
 const day=v=>new Date(v).toLocaleDateString("en-US",{timeZone:"UTC",day:"2-digit",month:"short"});
 const badge=(text,kind="")=>`<span class="badge ${h(kind)}">${h(text)}</span>`;
-const table=(heads,rows)=>`<table><thead><tr>${heads.map((x,i)=>`<th>${h(x)}</th>`).join("")}</tr></thead><tbody>${rows.join("")||`<tr><td colspan="${heads.length}" class="empty">No results for these filters.</td></tr>`}</tbody></table>`;
+// A head is either a label or {t:label, c:class, title:explanation}.
+const table=(heads,rows)=>`<table><thead><tr>${heads.map(x=>{const o=typeof x==="string"?{t:x}:x;
+ return `<th${o.c?` class="${h(o.c)}"`:""}${o.title?` title="${h(o.title)}"`:""}>${h(o.t)}</th>`}).join("")}</tr></thead><tbody>${rows.join("")||`<tr><td colspan="${heads.length}" class="empty">No results for these filters.</td></tr>`}</tbody></table>`;
 const state={tab:"overview",region:D.regions[0],mode:"tokens",resource:"",pages:{}};
 // Mirrors GAUGE_SUFFIXES in the collector: names whose statistics are not sums.
 const GAUGE_SUFFIXES=["Latency","TimeToFirstToken","TimeToFirstByte"];
@@ -1536,17 +1552,53 @@ const statMetric=(g,name,stat)=>g?.metrics.find(m=>m.metric.MetricName===name&&m
 // names (InvocationLatency, TimeToFirstToken) where only some were published.
 const gaugeMetrics=(g,stat)=>(g?.metrics||[]).filter(m=>m.stat===stat&&GAUGE_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
 const gaugeMetric=(g,stat)=>gaugeMetrics(g,stat).find(m=>m.points.length)||gaugeMetrics(g,stat)[0];
-const gaugeCell=(g,stat)=>{const m=gaugeMetric(g,stat);return m?fmt(m.summary.max)+"<small>"+h(m.metric.MetricName)+" · "+h(stat)+"</small>":fmt(null)};
+// Three states, never collapsed into one another: a figure, a series that
+// returned nothing, and a counter the namespace never published. None is a zero.
+const NO_DATA='<span class="quiet" title="Series queried; no datapoints returned. This is not a zero.">&#8211;</span>';
+const NOT_PUBLISHED='<span class="quiet" title="This namespace did not publish this counter. See metric_inventory.csv.">not published</span>';
+// Durations read as time, not as six-digit millisecond counts.
+const dur=ms=>ms==null?null:ms<1000?`${fmt(Math.round(ms))} ms`
+ :ms<120000?`${fmt(Number((ms/1000).toFixed(1)))} s`:`${fmt(Number((ms/60000).toFixed(1)))} min`;
 // Any discovered error or throttle counter for this group, by suffix.
 const errorMetrics=(g,suffix)=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.metric.MetricName.endsWith(suffix));
-const errorCell=(g,suffix)=>{const list=errorMetrics(g,suffix);return list.length?list.map(m=>fmt(m.summary.total)+"<small>"+h(m.metric.MetricName)+"</small>").join(""):"Not published"};
 const ERROR_SUFFIXES=["Throttles","ClientErrors","ServerErrors"];
+// Rejections and failures share one column: in a healthy account almost every
+// row is empty, so three near-empty columns cost width and hide the one that is not.
+const TROUBLE=[["Throttles","throttled","warn"],["ClientErrors","client errors","bad"],["ServerErrors","server errors","bad"]];
+const troubleFound=g=>TROUBLE.flatMap(([suffix,label,kind])=>errorMetrics(g,suffix)
+ .filter(m=>(m.summary.total??0)>0)
+ .map(m=>({label,kind,value:m.summary.total,name:m.metric.MetricName})));
+const troubleCell=g=>{
+ const hits=troubleFound(g);
+ if(hits.length)return `<div class="chips">${hits.map(x=>
+  `<span class="chip ${x.kind}" title="${h(x.name)}"><b>${fmt(x.value)}</b><em>${h(x.label)}</em></span>`).join("")}</div>`;
+ return TROUBLE.some(([suffix])=>errorMetrics(g,suffix).length)?NO_DATA:NOT_PUBLISHED;
+};
+const troubleKind=g=>{const hits=troubleFound(g);
+ return hits.some(x=>x.kind==="bad")?"flagged bad":hits.length?"flagged":""};
+// The dimension note earns its line only when it says something the bold
+// identifier above it does not. A model id needs no label; a value like
+// "default" does, or the row says nothing about which dimension it describes.
+const idNote=g=>!g.dims.length?"Aggregate series, without dimensions"
+ :g.extra||(["ModelId","Model"].includes(g.idName)?"":g.idName);
+const latencyCell=g=>{const m=gaugeMetric(g,"p99");
+ if(!m)return NOT_PUBLISHED;
+ if(m.summary.max==null)return NO_DATA;
+ return `<span title="${h(m.metric.MetricName)} p99 · highest value of any single period">${h(dur(m.summary.max))}</span>`};
 // Sum series this namespace publishes that no dedicated column covers, so a
 // namespace the report did not previously know about is still readable.
 const namedColumns=g=>{const mantle=g?.namespace==="AWS/BedrockMantle";return mantle?["Inferences","TotalInputTokens","TotalOutputTokens"]:["Invocations","InputTokenCount","OutputTokenCount"]};
 const otherCounters=g=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length&&!namedColumns(g).includes(m.metric.MetricName)&&!ERROR_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
-const otherCell=g=>{const list=otherCounters(g);return list.length?list.map(m=>fmt(m.summary.total)+"<small>"+h(m.metric.MetricName)+"</small>").join(""):fmt(null)};
-const totalCell=(g,name)=>fmt(total(g,name))+(sumMetric(g,name)&&!["ok","no_data"].includes(sumMetric(g,name).status)?"<small>Incomplete query</small>":"");
+// Seven stacked figures would set the height of every other cell in the row.
+// Name the count, and hand the detail to the chart, which is built to show it.
+const otherCell=g=>{const list=otherCounters(g);
+ if(!list.length)return `<span class="quiet">&#8211;</span>`;
+ return `<button type="button" class="more" data-group="${h(g.key)}" title="${h(list.map(m=>m.metric.MetricName).join(", "))}">`
+  +`${list.length} more &rarr;</button>`};
+const totalCell=(g,name)=>{const m=sumMetric(g,name);
+ if(!m)return NOT_PUBLISHED;
+ const flag=["ok","no_data"].includes(m.status)?"":"<small>Incomplete query</small>";
+ return (m.summary.total==null?NO_DATA:fmt(m.summary.total))+flag};
 let groups=[],chartData=null;
 
 function pagination(name,rows,draw,container,pager,size=15){
@@ -1566,7 +1618,8 @@ function buildGroups(){
    // The identifier is the model dimension when present, otherwise the first
    // dimension of the set. Whichever it is, do not repeat it in `extra`.
    const idDim=dims.find(d=>d.Name==="ModelId"||d.Name==="Model")||dims[0];
-   map.set(key,{key,id:idDim?.Value||"Account aggregate",namespace:m.metric.Namespace,dims,metrics:[],
+   map.set(key,{key,id:idDim?.Value||"Account aggregate",idName:idDim?.Name||"",
+    namespace:m.metric.Namespace,dims,metrics:[],
     endpoint:endpointLabel(m.metric.Namespace),
     extra:dims.filter(d=>d!==idDim).map(d=>d.Name+"="+d.Value).join(", ")});
   }map.get(key).metrics.push(m);
@@ -1593,11 +1646,25 @@ function renderOverview(){
  const daily=quotas.find(q=>q.quota_code==="L-E3F10727"&&q.name==="Cross-Model Max Tokens Per Day");
  if(daily)notices+=`<div class="note info"><strong>Daily cross-model quota: ${fmt(daily.applied_value)}.</strong> AWS default: ${fmt(daily.default_value)}. Utilization is unavailable: this quota uses pricing-based accounting, not a raw sum of token metrics.</div>`;
  $("run-notice").innerHTML=notices;
- const renderRows=items=>table(["Identifier","Endpoint","Accepted / completed requests","Input tokens","Output tokens","Latency p99","Throttles","Client errors","Server errors","Other published counters"],items.map(g=>{
+ const renderRows=items=>table([
+  "Identifier","Endpoint",
+  {t:"Requests",c:"num",title:"Accepted requests. Rejected ones are counted under Rejected or failed."},
+  {t:"Input tokens",c:"num"},{t:"Output tokens",c:"num"},
+  {t:"Latency p99",c:"num",title:"Highest p99 of any single period. Per-period statistics cannot be re-aggregated."},
+  "Rejected or failed","Also published",
+ ],items.map(g=>{
   const mantle=g.namespace==="AWS/BedrockMantle";
   // Error and throttle counters are matched by suffix, so a counter this
   // namespace publishes appears even if it is not in the curated list.
-  return `<tr><td><strong>${h(g.id)}</strong><small>${h(g.extra||(g.dims.length?g.dims.map(d=>d.Name).join(" + "):"Aggregate series, without dimensions"))}</small></td><td>${badge(g.endpoint)}</td><td>${totalCell(g,mantle?"Inferences":"Invocations")}</td><td>${totalCell(g,mantle?"TotalInputTokens":"InputTokenCount")}</td><td>${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td><td>${gaugeCell(g,"p99")}</td><td>${errorCell(g,"Throttles")}</td><td>${errorCell(g,"ClientErrors")}</td><td>${errorCell(g,"ServerErrors")}</td><td>${otherCell(g)}</td></tr>`;
+  return `<tr class="${h(troubleKind(g))}">`
+   +`<td><strong>${h(g.id)}</strong>${idNote(g)?`<small>${h(idNote(g))}</small>`:""}</td>`
+   +`<td>${badge(g.endpoint)}</td>`
+   +`<td class="num">${totalCell(g,mantle?"Inferences":"Invocations")}</td>`
+   +`<td class="num">${totalCell(g,mantle?"TotalInputTokens":"InputTokenCount")}</td>`
+   +`<td class="num">${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td>`
+   +`<td class="num">${latencyCell(g)}</td>`
+   +`<td>${troubleCell(g)}</td>`
+   +`<td>${otherCell(g)}</td></tr>`;
  }));
  pagination("usage",groups,renderRows,"usage-table","usage-page");
  renderChart();
@@ -1720,6 +1787,15 @@ $("region").onchange=()=>{state.region=$("region").value;state.pages={};refresh(
 $("resource").onchange=()=>{state.resource=$("resource").value;renderChart()};
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".section").forEach(x=>x.classList.toggle("active",x.id===state.tab));if(state.tab==="overview")renderChart();window.scrollTo({top:0,behavior:"smooth"})});
 document.querySelectorAll("#chart-tabs button").forEach(b=>b.onclick=()=>{state.mode=b.dataset.mode;document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x===b));renderChart()});
+// "n more" sends the identifier to the chart, which already plots every counter.
+document.addEventListener("click",event=>{
+ const more=event.target.closest(".more");if(!more)return;
+ state.resource=more.dataset.group;state.mode="counters";
+ document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x.dataset.mode==="counters"));
+ $("resource").value=state.resource;renderChart();
+ const still=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+ $("chart").scrollIntoView({behavior:still?"auto":"smooth",block:"center"});
+});
 for(const [ids,key,fn] of [[["quota-search","quota-kind","quota-adjustable"],"quota",renderQuotas],[["model-search"],"model",renderModels],[["profile-search"],"profile",renderProfiles],[["log-search","log-level","log-phase"],"runlog",renderRunLog]])for(const id of ids)$(id).addEventListener("input",()=>{state.pages[key]=0;fn()});
 $("chart").onmousemove=event=>{if(!chartData)return;const c=chartData,rect=$("chart").getBoundingClientRect(),x=event.clientX-rect.left,i=Math.floor((x-c.L)/c.width),tip=$("tooltip");if(i<0||i>=c.bins){tip.hidden=true;return}tip.innerHTML=`<strong>${h(when(c.start+i*c.step))}</strong><br>`+c.series.map(s=>`${h(s.label)}: ${s.values[i]===null?"no data":fmt(s.values[i])+c.unit}`).join("<br>");tip.hidden=false;tip.style.left=Math.min(Math.max(0,x+10),Math.max(0,c.w-290))+"px";tip.style.top="15px"};
 $("chart").onmouseleave=()=>{$("tooltip").hidden=true};
