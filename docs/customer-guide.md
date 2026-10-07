@@ -1,6 +1,6 @@
 # How to run the Bedrock Quotas & Usage Report
 
-> **Version 0.2.0 — English report and CLI.** Diagnostic queries run first, newest windows first, and incomplete reports can be resumed. Accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
+> **Version 0.4.0 — discovered metrics and dimensions.** Metric names, dimension sets and namespaces come from CloudWatch rather than a fixed list, latency is collected as a distribution, and the usage table gives every published counter its own column. Diagnostic queries still run first, newest windows first, and incomplete reports can be resumed. Accounts and Regions can expose different catalogs, quotas, permissions, and metrics; collection gaps are reported explicitly.
 
 Generate a report of your account's current Amazon Bedrock quotas, reported model availability, inference profiles, and historical usage. Clone the repository, run the collector in your own AWS account, then download **`report.html`** and **`quotas.csv`**.
 
@@ -204,7 +204,9 @@ The collector does not attach or modify IAM policies.
 
 **No data is not zero usage.** Missing datapoints can reflect inactivity, unavailable metrics, retention, permissions, discovery limits, or a different Region/dimension. The report preserves those limitations.
 
-**"Not published" and "N/A" mean different things.** `metric_inventory.csv` lists the metric names each Region and namespace actually reported. A cell reading `Not published` means the namespace never reported that counter. `N/A` means the series was queried and returned no datapoints. Neither one is a zero.
+**The two absence markers mean different things.** In the usage table, `–` means the series was queried and returned no datapoints. `∅` means the namespace never published that counter at all; `metric_inventory.csv` lists the names each Region and namespace actually reported. The table carries a legend, and each cell repeats the distinction in its tooltip. Neither marker is a zero.
+
+**Every published counter has a column.** The usage table shows one column per counter the Region reported, so a figure can be compared down the column. It scrolls sideways and keeps the identifier column pinned. A rule on a row's left edge marks a recorded rejection or failure: orange for throttling, red for an error. Latency is shown as a duration rather than a raw millisecond count.
 
 **Latency is a distribution, not a total.** Latency-style metrics are collected as `Average`, `Maximum` and `p99`. These are per-period statistics: CloudWatch computes each one inside its own interval, so they cannot be added up or re-aggregated into a single window-wide p99. The report shows the highest per-period value and says so.
 

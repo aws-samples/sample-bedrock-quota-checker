@@ -29,6 +29,15 @@ Metric names and dimension sets are **discovered**, not hardcoded. For each prob
 
 Discovery selects more series than a fixed list would, so `--max-metric-requests` defaults to 600. The run log prints the plan and warns before the budget truncates anything; priorities are unchanged, with error and throttle counters always retrieved first.
 
+### Reading the usage table
+
+**Series with observed data** gives each discovered counter its own column, so a figure can be read down the column instead of one identifier at a time. The table scrolls sideways and pins the identifier column, because a figure eight columns to the right otherwise belongs to a model whose name has scrolled out of view.
+
+- A rule on a row's left edge marks a recorded rejection or failure: orange for throttling, red for an error. Rejections and failures share one column that renders only what is non-zero.
+- Latency reads as a duration. A p99 of 577,116 ms is shown as `9.6 min`.
+- Absence is never a zero, and the two cases stay separate: `–` is a series that was queried and returned no datapoints, `∅` is a counter the namespace never published. A legend sits under the table and every cell keeps the distinction in its tooltip.
+- The chart below the selector plots tokens, requests, throttles, latency, or every counter in the group, one identifier at a time.
+
 All application-generated interface text, CLI messages, explanations, and documentation are in English. The HTML uses US English number formatting and UTC dates. Names and identifiers returned by AWS are preserved as received.
 
 ## Prerequisites
