@@ -1446,9 +1446,14 @@ select,input{border:1px solid #ccdadd;background:#fff;border-radius:7px;padding:
 .chip.warn b{color:var(--orange)}.chip.bad b{color:var(--brick)}
 tr.flagged td:first-child{box-shadow:inset 3px 0 0 var(--orange)}
 tr.flagged.bad td:first-child{box-shadow:inset 3px 0 0 var(--brick)}
-#usage-table td:first-child{min-width:210px}
-.more{appearance:none;border:0;background:none;padding:0;font:inherit;font-size:11px;color:var(--teal);cursor:pointer;text-align:left}
-.more:hover{text-decoration:underline}td small{display:block;font-size:10px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}tbody tr:hover{background:#fbfdfd}code{font-size:11px;color:#54727b;overflow-wrap:anywhere}
+/* One column per published counter, so the table scrolls sideways. The
+   identifier stays pinned, otherwise a figure eight columns to the right
+   belongs to a model whose name has scrolled out of view. */
+#usage-table th:first-child,#usage-table td:first-child{position:sticky;left:0;min-width:210px;background:#fff;border-right:1px solid var(--border)}
+#usage-table th:first-child{background:#f5f8f8;z-index:2}
+#usage-table td:first-child{z-index:1}
+#usage-table tbody tr:hover td:first-child{background:#fbfdfd}
+#usage-table th.extra{white-space:normal;max-width:150px}td small{display:block;font-size:10px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}tbody tr:hover{background:#fbfdfd}code{font-size:11px;color:#54727b;overflow-wrap:anywhere}
 .badge{display:inline-block;padding:3px 7px;border-radius:5px;font-size:10px;background:#eef3f4;color:#57727a;white-space:nowrap}.badge.good{background:#e9f5ed;color:#217348}.badge.warn{background:#fff3df;color:#935d15}.badge.bad{background:#fbece7;color:#a34f36}
 .pagebar{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-top:16px;font-size:12px;color:var(--muted)}.pagebar button{background:#fff;border:1px solid var(--border);padding:6px 12px;border-radius:6px;margin-left:5px}.pagebar button:disabled{opacity:.4;cursor:default}
 .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.empty{text-align:center;color:var(--muted);padding:45px 24px}.empty strong{display:block;color:var(--ink);font-size:17px;margin:8px}.quality-list{margin:0;padding-left:18px;color:var(--muted);font-size:12px}.quality-list li{margin:9px 0}.section{display:none}.section.active{display:block}.footer{margin-top:30px;color:#7a9198;font-size:11px;border-top:1px solid var(--border);padding-top:18px}
@@ -1490,7 +1495,7 @@ details summary{cursor:pointer;color:var(--teal);font-size:11px;margin-top:5px}d
    <div id="capacity-comparison"></div>
   </div>
   <div class="note">Historical usage is compared with today's quotas. Token estimates do not reproduce the <code>max_tokens</code> reservations used for capacity control. A low estimate does not rule out throttling.</div>
-  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic. A rule on the left edge marks a row that recorded a rejection or a failure.</p></div><a href="usage_summary.csv" download class="text-sm">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><div class="pagebar" id="usage-page"></div></div>
+  <div class="panel"><div class="panel-head"><div><h2>Series with observed data</h2><p>Volumes by identifier, without adding overlapping aggregates of the same traffic. A rule on the left edge marks a row that recorded a rejection or a failure. Every counter the Region published has its own column; scroll sideways to reach them.</p></div><a href="usage_summary.csv" download class="text-sm">↓ Usage CSV</a></div><div class="table-wrap" id="usage-table"></div><p class="muted text-xs" id="usage-legend"></p><div class="pagebar" id="usage-page"></div></div>
  </section>
  <section class="section" id="quotas">
   <div class="panel"><div class="panel-head"><div><h2>Current quotas</h2><p>Applied values and AWS defaults are kept separate.</p></div></div>
@@ -1554,8 +1559,12 @@ const gaugeMetrics=(g,stat)=>(g?.metrics||[]).filter(m=>m.stat===stat&&GAUGE_SUF
 const gaugeMetric=(g,stat)=>gaugeMetrics(g,stat).find(m=>m.points.length)||gaugeMetrics(g,stat)[0];
 // Three states, never collapsed into one another: a figure, a series that
 // returned nothing, and a counter the namespace never published. None is a zero.
+// Both are one glyph: across sixteen columns a repeated phrase outweighs the
+// figures it sits beside. The table carries a legend, and each cell its title.
 const NO_DATA='<span class="quiet" title="Series queried; no datapoints returned. This is not a zero.">&#8211;</span>';
-const NOT_PUBLISHED='<span class="quiet" title="This namespace did not publish this counter. See metric_inventory.csv.">not published</span>';
+const NOT_PUBLISHED='<span class="quiet" title="This namespace did not publish this counter. See metric_inventory.csv.">&#8709;</span>';
+const ABSENCE_LEGEND='<span class="quiet">&#8211;</span> queried, no datapoints returned &nbsp;·&nbsp; '
+ +'<span class="quiet">&#8709;</span> counter not published by this namespace &nbsp;·&nbsp; neither is a zero';
 // Durations read as time, not as six-digit millisecond counts.
 const dur=ms=>ms==null?null:ms<1000?`${fmt(Math.round(ms))} ms`
  :ms<120000?`${fmt(Number((ms/1000).toFixed(1)))} s`:`${fmt(Number((ms/60000).toFixed(1)))} min`;
@@ -1585,16 +1594,20 @@ const latencyCell=g=>{const m=gaugeMetric(g,"p99");
  if(!m)return NOT_PUBLISHED;
  if(m.summary.max==null)return NO_DATA;
  return `<span title="${h(m.metric.MetricName)} p99 · highest value of any single period">${h(dur(m.summary.max))}</span>`};
-// Sum series this namespace publishes that no dedicated column covers, so a
-// namespace the report did not previously know about is still readable.
-const namedColumns=g=>{const mantle=g?.namespace==="AWS/BedrockMantle";return mantle?["Inferences","TotalInputTokens","TotalOutputTokens"]:["Invocations","InputTokenCount","OutputTokenCount"]};
-const otherCounters=g=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length&&!namedColumns(g).includes(m.metric.MetricName)&&!ERROR_SUFFIXES.some(s=>m.metric.MetricName.endsWith(s)));
-// Seven stacked figures would set the height of every other cell in the row.
-// Name the count, and hand the detail to the chart, which is built to show it.
-const otherCell=g=>{const list=otherCounters(g);
- if(!list.length)return `<span class="quiet">&#8211;</span>`;
- return `<button type="button" class="more" data-group="${h(g.key)}" title="${h(list.map(m=>m.metric.MetricName).join(", "))}">`
-  +`${list.length} more &rarr;</button>`};
+// Names already carried by the Requests, Input tokens and Output tokens columns
+// of either endpoint. Excluding both endpoints' names keeps a runtime row from
+// growing an empty TotalInputTokens column, and a Mantle row an InputTokenCount one.
+const CORE_NAMES=["Invocations","Inferences","InputTokenCount","OutputTokenCount","TotalInputTokens","TotalOutputTokens"];
+const isExtra=name=>!CORE_NAMES.includes(name)&&!ERROR_SUFFIXES.some(s=>name.endsWith(s));
+const otherCounters=g=>(g?.metrics||[]).filter(m=>m.stat==="Sum"&&m.points.length&&isExtra(m.metric.MetricName));
+// Every counter the Region published gets its own column, so a figure can be
+// compared down the column instead of being stacked inside one cell. Derived
+// from all groups in the Region, not the current page, so columns stay put.
+const extraNames=()=>[...new Set(groups.flatMap(g=>otherCounters(g).map(m=>m.metric.MetricName)))].sort();
+// Header label from a metric name; the exact name stays in the header title.
+const metricLabel=name=>name.replace(/TokenCount$/,"Tokens")
+ .replace(/([A-Z]+)([A-Z][a-z])/g,"$1 $2").replace(/([a-z0-9])([A-Z])/g,"$1 $2")
+ .replace(/Cloud Watch/g,"CloudWatch");
 const totalCell=(g,name)=>{const m=sumMetric(g,name);
  if(!m)return NOT_PUBLISHED;
  const flag=["ok","no_data"].includes(m.status)?"":"<small>Incomplete query</small>";
@@ -1646,12 +1659,14 @@ function renderOverview(){
  const daily=quotas.find(q=>q.quota_code==="L-E3F10727"&&q.name==="Cross-Model Max Tokens Per Day");
  if(daily)notices+=`<div class="note info"><strong>Daily cross-model quota: ${fmt(daily.applied_value)}.</strong> AWS default: ${fmt(daily.default_value)}. Utilization is unavailable: this quota uses pricing-based accounting, not a raw sum of token metrics.</div>`;
  $("run-notice").innerHTML=notices;
+ const extras=extraNames();
  const renderRows=items=>table([
   "Identifier","Endpoint",
   {t:"Requests",c:"num",title:"Accepted requests. Rejected ones are counted under Rejected or failed."},
   {t:"Input tokens",c:"num"},{t:"Output tokens",c:"num"},
   {t:"Latency p99",c:"num",title:"Highest p99 of any single period. Per-period statistics cannot be re-aggregated."},
-  "Rejected or failed","Also published",
+  "Rejected or failed",
+  ...extras.map(name=>({t:metricLabel(name),c:"num extra",title:name})),
  ],items.map(g=>{
   const mantle=g.namespace==="AWS/BedrockMantle";
   // Error and throttle counters are matched by suffix, so a counter this
@@ -1664,8 +1679,10 @@ function renderOverview(){
    +`<td class="num">${totalCell(g,mantle?"TotalOutputTokens":"OutputTokenCount")}</td>`
    +`<td class="num">${latencyCell(g)}</td>`
    +`<td>${troubleCell(g)}</td>`
-   +`<td>${otherCell(g)}</td></tr>`;
+   +extras.map(name=>`<td class="num">${totalCell(g,name)}</td>`).join("")
+   +`</tr>`;
  }));
+ $("usage-legend").innerHTML=ABSENCE_LEGEND;
  pagination("usage",groups,renderRows,"usage-table","usage-page");
  renderChart();
 }
@@ -1787,15 +1804,6 @@ $("region").onchange=()=>{state.region=$("region").value;state.pages={};refresh(
 $("resource").onchange=()=>{state.resource=$("resource").value;renderChart()};
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));document.querySelectorAll(".section").forEach(x=>x.classList.toggle("active",x.id===state.tab));if(state.tab==="overview")renderChart();window.scrollTo({top:0,behavior:"smooth"})});
 document.querySelectorAll("#chart-tabs button").forEach(b=>b.onclick=()=>{state.mode=b.dataset.mode;document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x===b));renderChart()});
-// "n more" sends the identifier to the chart, which already plots every counter.
-document.addEventListener("click",event=>{
- const more=event.target.closest(".more");if(!more)return;
- state.resource=more.dataset.group;state.mode="counters";
- document.querySelectorAll("#chart-tabs button").forEach(x=>x.classList.toggle("active",x.dataset.mode==="counters"));
- $("resource").value=state.resource;renderChart();
- const still=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
- $("chart").scrollIntoView({behavior:still?"auto":"smooth",block:"center"});
-});
 for(const [ids,key,fn] of [[["quota-search","quota-kind","quota-adjustable"],"quota",renderQuotas],[["model-search"],"model",renderModels],[["profile-search"],"profile",renderProfiles],[["log-search","log-level","log-phase"],"runlog",renderRunLog]])for(const id of ids)$(id).addEventListener("input",()=>{state.pages[key]=0;fn()});
 $("chart").onmousemove=event=>{if(!chartData)return;const c=chartData,rect=$("chart").getBoundingClientRect(),x=event.clientX-rect.left,i=Math.floor((x-c.L)/c.width),tip=$("tooltip");if(i<0||i>=c.bins){tip.hidden=true;return}tip.innerHTML=`<strong>${h(when(c.start+i*c.step))}</strong><br>`+c.series.map(s=>`${h(s.label)}: ${s.values[i]===null?"no data":fmt(s.values[i])+c.unit}`).join("<br>");tip.hidden=false;tip.style.left=Math.min(Math.max(0,x+10),Math.max(0,c.w-290))+"px";tip.style.top="15px"};
 $("chart").onmouseleave=()=>{$("tooltip").hidden=true};
